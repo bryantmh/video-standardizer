@@ -33,7 +33,7 @@ def get_streams_info(input_file, stream_type):
         return [max_channels_stream] if max_channels_stream is not None else []
 
 def get_file_info(input_file):
-    cmd = ['ffprobe', '-v', 'error', '-show_entries', 'stream=width,height,codec_name:format', '-print_format', 'json', input_file]
+    cmd = ['ffprobe', '-v', 'error', '-show_entries', 'stream=width,height,codec_name,codec_type:format', '-print_format', 'json', input_file]
     result = subprocess.run(cmd, capture_output=True, text=True)
     output = json.loads(result.stdout)
     return output
@@ -43,7 +43,7 @@ def get_resolution(file_info):
         return None
     width = file_info['streams'][0]['width']
     height = file_info['streams'][0]['height']
-    if width >= 3840 or height >= 2160:
+    if width >= 3000 or height >= 1800:
         return "4K"
     elif width >= 1920 or height >= 1080:
         return "HD"
@@ -62,7 +62,7 @@ def get_encoding(file_info):
     return file_info['streams'][0]['codec_name'].upper()
     
 
-def extract_filename(input_file, dry_run=False):
+def extract_filename(input_file, extension, dry_run=False, verbose=False):
     match = re.search(r'([Ss](\d{1,2})[Ee](\d{1,2}))( - .*)?', input_file)
     if match:
         season = match.group(2).zfill(2)
@@ -70,12 +70,13 @@ def extract_filename(input_file, dry_run=False):
         filename = 'S' + season + 'E' + episode
         filename = filename.upper()
         if match.group(4):
-            filename += match.group(4)
+            filename_no_ext, _ = os.path.splitext(match.group(4))
+            filename += filename_no_ext
     else:
         filename = os.path.splitext(input_file)[0]
         
     file_info = get_file_info(input_file)
-    if dry_run:
+    if dry_run and verbose:
         pp.pprint(file_info)
         print('\n')
     resolution = get_resolution(file_info)
@@ -83,29 +84,39 @@ def extract_filename(input_file, dry_run=False):
     encoding = get_encoding(file_info)
     hasInfo = resolution or bitrate or encoding
     if hasInfo:
-        filename += " ("
+        filename += " ["
     if resolution:
         filename += f"{resolution}"
     if bitrate:
-        filename += f" {round(bitrate, 1) if bitrate < 10 else round(bitrate)}Mbps"
+        filename += f" {round(bitrate)}Mbps"
     if encoding:
         filename += f" {encoding}"
     if hasInfo: 
-        filename += ")"
+        filename += "]"
 
-    # Add the extension
-    # if os.path.splitext(input_file)[1].lower() == '.ts':
-        filename += '.mkv'
-    # else:
-    #     filename += os.path.splitext(input_file)[1]
-
-    return filename
+    filename += f".{extension}"
+    directory = os.path.dirname(input_file)
+    return os.path.join(directory, filename)
 
 
-def ffmpegConversion(file, dry_run=False):
-    output_file = extract_filename(file, dry_run)
+def ffmpegConversion(file, extension="mkv", dry_run=False, rename=False, verbose=False):
+    output_file = extract_filename(file, extension, dry_run, verbose)
+
     audio_streams = get_streams_info(file, 'a')
     subtitle_streams = get_streams_info(file, 's')
+
+    input_file_info = get_file_info(file)
+    input_audio_streams = [stream for stream in input_file_info['streams'] if stream['codec_type'] == 'audio']
+    input_subtitle_streams = [stream for stream in input_file_info['streams'] if stream['codec_type'] == 'subtitle']
+
+    if rename or (len(audio_streams) == len(input_audio_streams) and len(subtitle_streams) == len(input_subtitle_streams)):
+        if not dry_run:
+            os.rename(file, output_file)
+            print(f"Renamed {file} to {output_file}")
+            return
+        else:
+            print(f"Will rename {file} to {output_file}")
+            return
 
     # Check for subtitle files
     base_file_name = os.path.splitext(file)[0]
@@ -116,7 +127,7 @@ def ffmpegConversion(file, dry_run=False):
         subtitle_file = base_file_name + '.srt'
 
     if subtitle_file:
-        cmd = ['ffmpeg', '-i', file, '-i', subtitle_file, '-map', '0:v', '-c', 'copy', '-map', '1:s']
+        cmd = ['ffmpeg', '-i', file, '-i', subtitle_file, '-map', '0:v', '-c', 'copy', '-map', '1:s', '-metadata:s:s:0', 'language=eng']
         print(f"Subtitle file {subtitle_file} will be added\n")
     elif file.lower().endswith('.ts'):
         cmd = ['ffmpeg', '-i', file, '-map', '0:v', '-c', 'copy', '-f', 'mkv']
@@ -152,6 +163,10 @@ def main():
     parser.add_argument("-f", "--folder", help="Folder path containing the files to process")
     parser.add_argument("-i", "--input", help="Single input file name")
     parser.add_argument("-d", "--dry-run", action='store_true', help="Debug: print the command instead of executing it")
+    parser.add_argument("-e", "--extension", help="Output file extension", default='mkv')
+    parser.add_argument("-r", "--rename", action='store_true', help="Just rename the files without re-encoding")
+    parser.add_argument("-v", "--verbose", action='store_true', help="Print more information")
+
 
     args = parser.parse_args()
 
@@ -161,7 +176,6 @@ def main():
         return
     elif args.folder:
         folder_path = args.folder
-        print(folder_path)
         if not os.path.isdir(folder_path):
             print("Invalid folder path.")
             return
@@ -173,7 +187,7 @@ def main():
         files = [input_file]
     
     for file in files:
-        ffmpegConversion(file, dry_run)
+        ffmpegConversion(file, args.extension, dry_run, args.rename, args.verbose)
       
 
 if __name__ == "__main__":
