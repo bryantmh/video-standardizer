@@ -4,6 +4,10 @@ import re
 import os
 import argparse
 import sys
+import pprint
+
+pp = pprint.PrettyPrinter(indent=4)
+
 
 def get_streams_info(input_file, stream_type):
     cmd = ['ffprobe', '-v', 'quiet', '-select_streams', stream_type,
@@ -53,6 +57,8 @@ def get_bitrate(file_info):
 
 
 def get_encoding(file_info):
+    if 'streams' not in file_info or len(file_info['streams']) == 0 or 'codec_name' not in file_info['streams'][0]:
+        return None
     return file_info['streams'][0]['codec_name'].upper()
     
 
@@ -70,7 +76,8 @@ def extract_filename(input_file, dry_run=False):
         
     file_info = get_file_info(input_file)
     if dry_run:
-        print('File Info: ', file_info, '\n')
+        pp.pprint(file_info)
+        print('\n')
     resolution = get_resolution(file_info)
     bitrate = get_bitrate(file_info)
     encoding = get_encoding(file_info)
@@ -87,10 +94,10 @@ def extract_filename(input_file, dry_run=False):
         filename += ")"
 
     # Add the extension
-    if os.path.splitext(input_file)[1].lower() == '.ts':
-        filename += '.mp4'
-    else:
-        filename += os.path.splitext(input_file)[1]
+    # if os.path.splitext(input_file)[1].lower() == '.ts':
+        filename += '.mkv'
+    # else:
+    #     filename += os.path.splitext(input_file)[1]
 
     return filename
 
@@ -100,8 +107,19 @@ def ffmpegConversion(file, dry_run=False):
     audio_streams = get_streams_info(file, 'a')
     subtitle_streams = get_streams_info(file, 's')
 
-    if file.lower().endswith('.ts'):
-        cmd = ['ffmpeg', '-i', file, '-map', '0:v', '-c', 'copy', '-f', 'mp4']
+    # Check for subtitle files
+    base_file_name = os.path.splitext(file)[0]
+    subtitle_file = None
+    if os.path.exists(base_file_name + '.en.srt'):
+        subtitle_file = base_file_name + '.en.srt'
+    elif os.path.exists(base_file_name + '.srt'):
+        subtitle_file = base_file_name + '.srt'
+
+    if subtitle_file:
+        cmd = ['ffmpeg', '-i', file, '-i', subtitle_file, '-map', '0:v', '-c', 'copy', '-map', '1:s']
+        print(f"Subtitle file {subtitle_file} will be added\n")
+    elif file.lower().endswith('.ts'):
+        cmd = ['ffmpeg', '-i', file, '-map', '0:v', '-c', 'copy', '-f', 'mkv']
     else:
         cmd = ['ffmpeg', '-i', file, '-map', '0:v', '-c', 'copy']
 
@@ -111,13 +129,13 @@ def ffmpegConversion(file, dry_run=False):
     for subtitle_index in subtitle_streams:
         metadata_option = f'-metadata:s:s:{subtitle_index}'
         cmd.extend(['-map', f'0:s:{subtitle_index}', metadata_option, 'language=eng'])
-    cmd.append(output_file)
-    if dry_run:
-        print("Output Filename: ", output_file, '\n')
-    else:
-        subprocess.run(cmd)
 
-    print(f"Video, English audio ({audio_streams}) and English subtitles ({subtitle_streams}) copied to {output_file}\n")
+    cmd.append(output_file)
+
+    print(f"Video, English audio tracks: ({audio_streams}) and English subtitle tracks: ({subtitle_streams}) will be copied to {output_file}\n")
+
+    if not dry_run:
+        subprocess.run(cmd)
 
 
 def main():
@@ -143,6 +161,7 @@ def main():
         return
     elif args.folder:
         folder_path = args.folder
+        print(folder_path)
         if not os.path.isdir(folder_path):
             print("Invalid folder path.")
             return
