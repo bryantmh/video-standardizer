@@ -96,7 +96,7 @@ def extract_filename(input_file, extension, dry_run=False, verbose=False):
 
     filename += f".{extension}"
     directory = os.path.dirname(input_file)
-    return os.path.join(directory, filename)
+    return os.path.join(directory, filename) if match else filename
 
 
 def ffmpegConversion(file, extension="mkv", dry_run=False, rename=False, verbose=False):
@@ -109,15 +109,6 @@ def ffmpegConversion(file, extension="mkv", dry_run=False, rename=False, verbose
     input_audio_streams = [stream for stream in input_file_info['streams'] if stream['codec_type'] == 'audio']
     input_subtitle_streams = [stream for stream in input_file_info['streams'] if stream['codec_type'] == 'subtitle']
 
-    if rename or (len(audio_streams) == len(input_audio_streams) and len(subtitle_streams) == len(input_subtitle_streams)):
-        if not dry_run:
-            os.rename(file, output_file)
-            print(f"Renamed {file} to {output_file}")
-            return
-        else:
-            print(f"Will rename {file} to {output_file}")
-            return
-
     # Check for subtitle files
     base_file_name = os.path.splitext(file)[0]
     subtitle_file = None
@@ -125,8 +116,19 @@ def ffmpegConversion(file, extension="mkv", dry_run=False, rename=False, verbose
         subtitle_file = base_file_name + '.en.srt'
     elif os.path.exists(base_file_name + '.srt'):
         subtitle_file = base_file_name + '.srt'
+    elif os.path.exists(base_file_name + '.sub'):
+        subtitle_file = base_file_name + '.sub'
 
-    if subtitle_file:
+    if rename or (len(audio_streams) == len(input_audio_streams) and len(subtitle_streams) == len(input_subtitle_streams) and not subtitle_file and f".{extension}" == os.path.splitext(file)[1] ):
+        if not dry_run:
+            os.rename(file, output_file)
+            print(f"Renamed {file} to {output_file}\n")
+            return
+        else:
+            print(f"Will rename {file} to {output_file}\n")
+            return
+
+    if subtitle_file and not len(subtitle_streams):
         cmd = ['ffmpeg', '-i', file, '-i', subtitle_file, '-map', '0:v', '-c', 'copy', '-map', '1:s', '-metadata:s:s:0', 'language=eng']
         print(f"Subtitle file {subtitle_file} will be added\n")
     elif file.lower().endswith('.ts'):
@@ -179,7 +181,7 @@ def main():
         if not os.path.isdir(folder_path):
             print("Invalid folder path.")
             return
-        files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if os.path.isfile(os.path.join(folder_path, f)) and not f.endswith('.srt') and not f.endswith('.db')]
+        files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if os.path.isfile(os.path.join(folder_path, f)) and (f.endswith('.mkv') or f.endswith('.mp4') or f.endswith('.ts') or f.endswith('.mov'))]
     elif args.input:
         files = [args.input]
     else:
