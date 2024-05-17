@@ -17,18 +17,30 @@ def get_streams_info(input_file, stream_type):
     if not 'streams' in output or not len(output['streams']):
         return []
     offset = output['streams'][0]['index']
-    streams = []
+    all_streams = []
+    english_streams = []
+    no_608 = []
     max_channels_stream = None
     max_channels = 0
     for stream in output['streams']:
         channels = stream.get('channels', 0)
         if stream_type == 's' and (not 'tags' in stream or not 'language' in stream['tags'] or stream['tags']['language'] == 'eng' or stream['tags']['language'] == 'und'):
-            streams.append(stream['index'] - offset)
+            all_streams.append(stream['index'] - offset)
+            if stream['tags']['language'] == 'eng':
+                english_streams.append(stream['index'] - offset)
+                if stream['codec_name'] != 'eia_608':
+                    no_608.append(stream['index'] - offset)
         elif channels > max_channels and (not 'tags' in stream or not 'language' in stream['tags'] or stream['tags']['language'] == 'eng' or stream['tags']['language'] == 'und'):
             max_channels = channels
             max_channels_stream = stream['index'] - offset
     if stream_type == 's':
-        return streams
+        if len(english_streams):
+            if len(no_608):
+                return no_608
+            else:
+                return english_streams
+        else:
+            return all_streams
     else:
         return [max_channels_stream] if max_channels_stream is not None else []
 
@@ -39,16 +51,18 @@ def get_file_info(input_file):
     return output
 
 def get_resolution(file_info):
-    if 'streams' not in file_info or len(file_info['streams']) == 0 or 'width' not in file_info['streams'][0] or 'height' not in file_info['streams'][0]:
-        return None
-    width = file_info['streams'][0]['width']
-    height = file_info['streams'][0]['height']
-    if width >= 3000 or height >= 1800:
-        return "4K"
-    elif width >= 1920 or height >= 1080:
-        return "HD"
-    else:
-        return "SD"
+    for stream in file_info.get('streams', []):
+        if stream.get('codec_type') == 'video':
+            width = stream.get('width')
+            height = stream.get('height')
+            if width and height:
+                if width >= 3000 or height >= 1800:
+                    return "4K"
+                elif width >= 1800 or height >= 1000:
+                    return "HD"
+                else:
+                    return "SD"
+    return None
 
 def get_bitrate(file_info):
     if 'format' in file_info and 'bit_rate' in file_info['format']:
@@ -57,12 +71,21 @@ def get_bitrate(file_info):
 
 
 def get_encoding(file_info):
-    if 'streams' not in file_info or len(file_info['streams']) == 0 or 'codec_name' not in file_info['streams'][0]:
-        return None
-    return file_info['streams'][0]['codec_name'].upper()
+    for stream in file_info.get('streams', []):
+        if stream.get('codec_type') == 'video':
+            return stream.get('codec_name', '').upper()
+    return None
     
 
-def extract_filename(input_file, extension, dry_run=False, verbose=False):
+def extract_filename(input_file, extension, dry_run=False, verbose=False, norename=False):
+    directory = os.path.join(os.path.dirname(input_file), 'out')
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+    if norename:
+        filename, _ = os.path.splitext(os.path.basename(input_file))
+        return os.path.join(directory, f"{filename}.{extension}")
+
     match = re.search(r'([Ss](\d{1,2})[Ee](\d{1,2}))( - .*)?', input_file)
     if match:
         season = match.group(2).zfill(2)
@@ -73,7 +96,12 @@ def extract_filename(input_file, extension, dry_run=False, verbose=False):
             filename_no_ext, _ = os.path.splitext(match.group(4))
             filename += filename_no_ext
     else:
-        filename = os.path.splitext(input_file)[0]
+        newfilename, _ = os.path.splitext(os.path.basename(input_file))
+        filename = os.path.join(directory, f"{newfilename}")
+
+    pattern = r'\[\w+ \d+Mbps \w+\].\w+$'
+    if re.search(pattern, input_file):
+        return False
         
     file_info = get_file_info(input_file)
     if dry_run and verbose:
@@ -95,12 +123,14 @@ def extract_filename(input_file, extension, dry_run=False, verbose=False):
         filename += "]"
 
     filename += f".{extension}"
-    directory = os.path.dirname(input_file)
     return os.path.join(directory, filename) if match else filename
 
 
-def ffmpegConversion(file, extension="mkv", dry_run=False, rename=False, verbose=False):
-    output_file = extract_filename(file, extension, dry_run, verbose)
+def ffmpegConversion(file, extension="mkv", dry_run=False, rename=False, verbose=False, subtitle_convert=False, norename=False):
+    output_file = extract_filename(file, extension, dry_run, verbose, norename)
+    if not output_file:
+        print(f"Skipping {file} as it is already processed\n")
+        return
 
     audio_streams = get_streams_info(file, 'a')
     subtitle_streams = get_streams_info(file, 's')
@@ -133,6 +163,8 @@ def ffmpegConversion(file, extension="mkv", dry_run=False, rename=False, verbose
         print(f"Subtitle file {subtitle_file} will be added\n")
     elif file.lower().endswith('.ts'):
         cmd = ['ffmpeg', '-i', file, '-map', '0:v', '-c', 'copy', '-f', 'mkv']
+    elif subtitle_convert:
+        cmd = ['ffmpeg', '-i', file, '-map', '0:v', '-c', 'copy', '-c:s', 'srt']
     else:
         cmd = ['ffmpeg', '-i', file, '-map', '0:v', '-c', 'copy']
 
@@ -168,6 +200,8 @@ def main():
     parser.add_argument("-e", "--extension", help="Output file extension", default='mkv')
     parser.add_argument("-r", "--rename", action='store_true', help="Just rename the files without re-encoding")
     parser.add_argument("-v", "--verbose", action='store_true', help="Print more information")
+    parser.add_argument("-s", '--subtitle-convert', action='store_true', help="Convert subtitles to srt")
+    parser.add_argument("-n", "--norename", action="store_true", help="Don't rename")
 
 
     args = parser.parse_args()
@@ -181,7 +215,7 @@ def main():
         if not os.path.isdir(folder_path):
             print("Invalid folder path.")
             return
-        files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if os.path.isfile(os.path.join(folder_path, f)) and (f.endswith('.mkv') or f.endswith('.mp4') or f.endswith('.ts') or f.endswith('.mov'))]
+        files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if os.path.isfile(os.path.join(folder_path, f)) and (f.endswith('.mkv') or f.endswith('.m4v') or f.endswith('.mp4') or f.endswith('.ts') or f.endswith('.mov') or f.endswith('.mpg') or f.endswith('.avi') or f.endswith('.flv'))]
     elif args.input:
         files = [args.input]
     else:
@@ -189,7 +223,7 @@ def main():
         files = [input_file]
     
     for file in files:
-        ffmpegConversion(file, args.extension, dry_run, args.rename, args.verbose)
+        ffmpegConversion(file, args.extension, dry_run, args.rename, args.verbose, args.subtitle_convert, args.norename)
       
 
 if __name__ == "__main__":
