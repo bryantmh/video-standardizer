@@ -12,7 +12,7 @@ pp = pprint.PrettyPrinter(indent=4)
 def get_streams_info(input_file, stream_type):
     cmd = ['ffprobe', '-v', 'quiet', '-select_streams', stream_type,
            '-show_entries', 'stream=index,codec_name,bit_rate,channels,bits_per_raw_sample:stream_tags=language', '-print_format', 'json', input_file]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
     output = json.loads(result.stdout)
     if not 'streams' in output or not len(output['streams']):
         return []
@@ -46,7 +46,7 @@ def get_streams_info(input_file, stream_type):
 
 def get_file_info(input_file):
     cmd = ['ffprobe', '-v', 'error', '-show_entries', 'stream=width,height,codec_name,codec_type:format', '-print_format', 'json', input_file]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
     output = json.loads(result.stdout)
     return output
 
@@ -77,8 +77,12 @@ def get_encoding(file_info):
     return None
     
 
-def extract_filename(input_file, extension, dry_run=False, verbose=False, norename=False):
-    directory = os.path.join(os.path.dirname(input_file), 'out')
+def extract_filename(input_file, extension, dry_run=False, verbose=False, norename=False, convert_force=False, output=False):
+    if output:
+        directory = os.path.join(os.path.dirname(input_file), 'out')
+    else:
+        directory = os.path.dirname(input_file)
+
     if not os.path.exists(directory):
         os.makedirs(directory)
 
@@ -100,7 +104,7 @@ def extract_filename(input_file, extension, dry_run=False, verbose=False, norena
         filename = os.path.join(directory, f"{newfilename}")
 
     pattern = r'\[\w+ \d+Mbps \w+\].\w+$'
-    if re.search(pattern, input_file):
+    if not convert_force and re.search(pattern, input_file):
         return False
         
     file_info = get_file_info(input_file)
@@ -126,8 +130,16 @@ def extract_filename(input_file, extension, dry_run=False, verbose=False, norena
     return os.path.join(directory, filename) if match else filename
 
 
-def ffmpegConversion(file, extension="mkv", dry_run=False, rename=False, verbose=False, subtitle_convert=False, norename=False):
-    output_file = extract_filename(file, extension, dry_run, verbose, norename)
+def get_supported_subtitle_codecs(container):
+    if container == 'mkv':
+        return ['srt', 'ass', 'ssa', 'vtt', 'hdmv_pgs_subtitle']
+    elif container == 'mp4':
+        return ['mov_text']
+    else:
+        return []
+
+def ffmpegConversion(file, extension="mkv", dry_run=False, rename=False, verbose=False, subtitle_convert=False, norename=False, convert_force=False, output=False):
+    output_file = extract_filename(file, extension, dry_run, verbose, norename, convert_force, output)
     if not output_file:
         print(f"Skipping {file} as it is already processed\n")
         return
@@ -149,22 +161,33 @@ def ffmpegConversion(file, extension="mkv", dry_run=False, rename=False, verbose
     elif os.path.exists(base_file_name + '.sub'):
         subtitle_file = base_file_name + '.sub'
 
-    if rename or (len(audio_streams) == len(input_audio_streams) and len(subtitle_streams) == len(input_subtitle_streams) and not subtitle_file and f".{extension}" == os.path.splitext(file)[1] ):
+    if not convert_force and (rename or (len(audio_streams) == len(input_audio_streams) and len(subtitle_streams) == len(input_subtitle_streams) and not subtitle_file )):
+        original_extension = os.path.splitext(file)[1]
+        output_file_with_original_extension = os.path.splitext(output_file)[0] + original_extension
         if not dry_run:
-            os.rename(file, output_file)
-            print(f"Renamed {file} to {output_file}\n")
+            os.rename(file, output_file_with_original_extension)
+            print(f"Renamed {file} to {output_file_with_original_extension}\n")
             return
         else:
-            print(f"Will rename {file} to {output_file}\n")
+            print(f"Will rename {file} to {output_file_with_original_extension}\n")
             return
 
+    supported = get_supported_subtitle_codecs(extension)
+    for index in subtitle_streams:
+        subtitle_codec = input_subtitle_streams[index]['codec_name']
+        print(subtitle_codec)
+        if subtitle_codec not in supported:
+            print(f"Subtitle codec {subtitle_codec} is not supported for {extension} container\n")
+            subtitle_convert = supported[0]
+            break
+        
     if subtitle_file and not len(subtitle_streams):
         cmd = ['ffmpeg', '-i', file, '-i', subtitle_file, '-map', '0:v', '-c', 'copy', '-map', '1:s', '-metadata:s:s:0', 'language=eng']
         print(f"Subtitle file {subtitle_file} will be added\n")
     elif file.lower().endswith('.ts'):
         cmd = ['ffmpeg', '-i', file, '-map', '0:v', '-c', 'copy', '-f', 'mkv']
     elif subtitle_convert:
-        cmd = ['ffmpeg', '-i', file, '-map', '0:v', '-c', 'copy', '-c:s', 'srt']
+        cmd = ['ffmpeg', '-i', file, '-map', '0:v', '-c', 'copy', '-c:s', subtitle_convert]
     else:
         cmd = ['ffmpeg', '-i', file, '-map', '0:v', '-c', 'copy']
 
@@ -202,6 +225,8 @@ def main():
     parser.add_argument("-v", "--verbose", action='store_true', help="Print more information")
     parser.add_argument("-s", '--subtitle-convert', action='store_true', help="Convert subtitles to srt")
     parser.add_argument("-n", "--norename", action="store_true", help="Don't rename")
+    parser.add_argument("-c", "--convert-force", action="store_true", help="Convert file even if it is already processed")
+    parser.add_argument("-o", "--output", help="Output folder path")
 
 
     args = parser.parse_args()
@@ -223,7 +248,7 @@ def main():
         files = [input_file]
     
     for file in files:
-        ffmpegConversion(file, args.extension, dry_run, args.rename, args.verbose, args.subtitle_convert, args.norename)
+        ffmpegConversion(file, args.extension, dry_run, args.rename, args.verbose, args.subtitle_convert, args.norename, args.convert_force, args.output)
       
 
 if __name__ == "__main__":
