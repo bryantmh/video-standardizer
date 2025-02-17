@@ -26,7 +26,7 @@ def get_streams_info(input_file, stream_type):
         channels = stream.get('channels', 0)
         if stream_type == 's' and (not 'tags' in stream or not 'language' in stream['tags'] or stream['tags']['language'] == 'eng' or stream['tags']['language'] == 'und'):
             all_streams.append(stream['index'] - offset)
-            if stream['tags']['language'] == 'eng':
+            if stream['tags'] and stream['tags']['language'] == 'eng':
                 english_streams.append(stream['index'] - offset)
                 if stream['codec_name'] != 'eia_608':
                     no_608.append(stream['index'] - offset)
@@ -132,7 +132,7 @@ def extract_filename(input_file, extension, dry_run=False, verbose=False, norena
 
 def get_supported_subtitle_codecs(container):
     if container == 'mkv':
-        return ['srt', 'ass', 'ssa', 'vtt', 'hdmv_pgs_subtitle']
+        return ['srt', 'ass', 'ssa', 'vtt', 'hdmv_pgs_subtitle', 'dvd_subtitle']
     elif container == 'mp4':
         return ['mov_text']
     else:
@@ -156,6 +156,8 @@ def ffmpegConversion(file, extension="mkv", dry_run=False, rename=False, verbose
     subtitle_file = None
     if os.path.exists(base_file_name + '.en.srt'):
         subtitle_file = base_file_name + '.en.srt'
+    elif os.path.exists(base_file_name + '.eng.srt'):
+        subtitle_file = base_file_name + '.eng.srt'
     elif os.path.exists(base_file_name + '.srt'):
         subtitle_file = base_file_name + '.srt'
     elif os.path.exists(base_file_name + '.sub'):
