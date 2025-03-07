@@ -138,7 +138,7 @@ def get_supported_subtitle_codecs(container):
     else:
         return []
 
-def ffmpegConversion(file, extension="mkv", dry_run=False, rename=False, verbose=False, subtitle_convert=False, norename=False, convert_force=False, output=False):
+def ffmpegConversion(file, extension="mkv", dry_run=False, rename=False, verbose=False, subtitle_convert=False, norename=False, convert_force=False, output=False, subtitle_only=False):
     output_file = extract_filename(file, extension, dry_run, verbose, norename, convert_force, output)
     if not output_file:
         print(f"Skipping {file} as it is already processed\n")
@@ -184,18 +184,24 @@ def ffmpegConversion(file, extension="mkv", dry_run=False, rename=False, verbose
             break
         
     if subtitle_file and not len(subtitle_streams):
-        cmd = ['ffmpeg', '-i', file, '-i', subtitle_file, '-map', '0:v', '-c', 'copy', '-map', '1:s', '-metadata:s:s:0', 'language=eng']
+        cmd = ['ffmpeg', '-i', file, '-i', subtitle_file, '-map', '0:v:0', '-c', 'copy', '-map', '1:s', '-metadata:s:s:0', 'language=eng']
         print(f"Subtitle file {subtitle_file} will be added\n")
     elif file.lower().endswith('.ts'):
-        cmd = ['ffmpeg', '-i', file, '-map', '0:v', '-c', 'copy', '-f', 'mkv']
+        cmd = ['ffmpeg', '-i', file, '-map', '0:v:0', '-c', 'copy', '-f', 'mkv']
     elif subtitle_convert:
-        cmd = ['ffmpeg', '-i', file, '-map', '0:v', '-c', 'copy', '-c:s', subtitle_convert]
+        cmd = ['ffmpeg', '-i', file, '-map', '0:v:0', '-c', 'copy', '-c:s', subtitle_convert]
     else:
-        cmd = ['ffmpeg', '-i', file, '-map', '0:v', '-c', 'copy']
+        cmd = ['ffmpeg', '-i', file, '-map', '0:v:0', '-c', 'copy']
 
-    for audio_index in audio_streams:
-        metadata_option = f'-metadata:s:a:{audio_index}'
-        cmd.extend(['-map', f'0:a:{audio_index}', metadata_option, 'language=eng'])
+    if subtitle_only:
+        for audio_index in range(len(input_audio_streams)):
+            metadata_option = f'-metadata:s:a:{audio_index}'
+            cmd.extend(['-map', f'0:a:{audio_index}', metadata_option, 'language=eng'])
+    else:
+        for audio_index in audio_streams:
+            metadata_option = f'-metadata:s:a:{audio_index}'
+            cmd.extend(['-map', f'0:a:{audio_index}', metadata_option, 'language=eng'])
+            
     for subtitle_index in subtitle_streams:
         metadata_option = f'-metadata:s:s:{subtitle_index}'
         cmd.extend(['-map', f'0:s:{subtitle_index}', metadata_option, 'language=eng'])
@@ -229,9 +235,18 @@ def main():
     parser.add_argument("-n", "--norename", action="store_true", help="Don't rename")
     parser.add_argument("-c", "--convert-force", action="store_true", help="Convert file even if it is already processed")
     parser.add_argument("-o", "--output", help="Output folder path")
-
+    parser.add_argument("-so", "--subtitle-only", action="store_true", help="Only perform subtitle operations and leave audio untouched")
+    parser.add_argument("--gui", action="store_true", help="Launch GUI")
 
     args = parser.parse_args()
+
+    if args.gui:
+        import tkinter as tk
+        from gui import VideoStandardizerGUI
+        root = tk.Tk()
+        app = VideoStandardizerGUI(root)
+        root.mainloop()
+        return
 
     dry_run = args.dry_run
     if args.folder and args.input:
@@ -250,7 +265,7 @@ def main():
         files = [input_file]
     
     for file in files:
-        ffmpegConversion(file, args.extension, dry_run, args.rename, args.verbose, args.subtitle_convert, args.norename, args.convert_force, args.output)
+        ffmpegConversion(file, args.extension, dry_run, args.rename, args.verbose, args.subtitle_convert, args.norename, args.convert_force, args.output, args.subtitle_only)
       
 
 if __name__ == "__main__":
