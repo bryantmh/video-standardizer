@@ -183,28 +183,58 @@ def ffmpegConversion(file, extension="mkv", dry_run=False, rename=False, verbose
             subtitle_convert = supported[0]
             break
         
+    # Build base ffmpeg command and handle subtitle conversion/copy carefully.
+    # We avoid using a global copy codec which would apply to subtitles and cause
+    # multiple -c options for the same stream. Instead, set `-c:v copy` and
+    # `-c:a copy` per audio/video stream and only set `-c:s` when conversion is
+    # valid (text->text or bitmap->bitmap).
+    base_cmd = ['ffmpeg', '-i', file]
+
     if subtitle_file and not len(subtitle_streams):
-        cmd = ['ffmpeg', '-i', file, '-i', subtitle_file, '-map', '0:v:0', '-c', 'copy', '-map', '1:s', '-metadata:s:s:0', 'language=eng']
+        # Add external subtitle file as a second input
+        base_cmd.extend(['-i', subtitle_file])
         print(f"Subtitle file {subtitle_file} will be added\n")
-    elif file.lower().endswith('.ts'):
-        cmd = ['ffmpeg', '-i', file, '-map', '0:v:0', '-c', 'copy', '-f', 'mkv']
-    elif subtitle_convert:
-        cmd = ['ffmpeg', '-i', file, '-map', '0:v:0', '-c', 'copy', '-c:s', subtitle_convert]
-    else:
-        cmd = ['ffmpeg', '-i', file, '-map', '0:v:0', '-c', 'copy']
+
+    # Always map first video stream and copy video
+    cmd = list(base_cmd)
+    cmd.extend(['-map', '0:v:0', '-c:v', 'copy'])
 
     if subtitle_only:
         for audio_index in range(len(input_audio_streams)):
             metadata_option = f'-metadata:s:a:{audio_index}'
-            cmd.extend(['-map', f'0:a:{audio_index}', metadata_option, 'language=eng'])
+            cmd.extend(['-map', f'0:a:{audio_index}', '-c:a', 'copy'])
     else:
         for audio_index in audio_streams:
             metadata_option = f'-metadata:s:a:{audio_index}'
-            cmd.extend(['-map', f'0:a:{audio_index}', metadata_option, 'language=eng'])
+            cmd.extend(['-map', f'0:a:{audio_index}', metadata_option, 'language=eng', '-c:a', 'copy'])
             
+    # Handle subtitle streams: decide whether to copy or convert per-stream.
     for subtitle_index in subtitle_streams:
         metadata_option = f'-metadata:s:s:{subtitle_index}'
-        cmd.extend(['-map', f'0:s:{subtitle_index}', metadata_option, 'language=eng'])
+        # Inspect input subtitle codec
+        subtitle_codec = input_subtitle_streams[subtitle_index]['codec_name']
+        # If subtitle_convert is requested, check compatibility. ffmpeg only
+        # supports text->text and bitmap->bitmap subtitle encoding. If the
+        # requested conversion would cross types, just copy the subtitle stream
+        # instead of attempting invalid re-encoding.
+        if subtitle_convert:
+            # Determine rough type by codec name: treat known text codecs as text
+            text_codecs = {'srt', 'ass', 'ssa', 'mov_text', 'webvtt', 'vtt'}
+            bitmap_codecs = {'hdmv_pgs_subtitle', 'dvd_subtitle'}
+            src_is_text = subtitle_codec in text_codecs
+            src_is_bitmap = subtitle_codec in bitmap_codecs
+            dest_is_text = subtitle_convert in text_codecs
+            dest_is_bitmap = subtitle_convert in bitmap_codecs
+
+            if (src_is_text and dest_is_text) or (src_is_bitmap and dest_is_bitmap):
+                # valid conversion
+                cmd.extend(['-map', f'0:s:{subtitle_index}', metadata_option, 'language=eng', '-c:s', subtitle_convert])
+            else:
+                # incompatible conversion: copy the stream instead
+                cmd.extend(['-map', f'0:s:{subtitle_index}', metadata_option, 'language=eng', '-c:s', 'copy'])
+        else:
+            # No conversion requested: copy subtitle stream
+            cmd.extend(['-map', f'0:s:{subtitle_index}', metadata_option, 'language=eng', '-c:s', 'copy'])
 
     cmd.append(output_file)
 
