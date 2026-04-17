@@ -149,7 +149,7 @@ def get_encoding(streams):
     return None
 
 
-def extract_episode_info(filename):
+def extract_episode_info(filename, keep_suffix=False):
     patterns = [
         r'[Ss](\d{1,2})([Ee]\d{1,2}(?:[Ee]\d{1,2})+)',
         r'[Ss](\d{1,2})([Ee]\d{1,2}-[Ee]\d{1,2})',
@@ -165,14 +165,20 @@ def extract_episode_info(filename):
             suffix = match.group(3) if match.group(3) else ''
             if suffix:
                 suffix = os.path.splitext(suffix)[0]
-                if not suffix.startswith(' - '):
+                if suffix.startswith(' - '):
+                    pass  # already properly formatted
+                elif keep_suffix:
+                    title = suffix.lstrip(' ._-')
+                    suffix = f' - {title}' if title else ''
+                else:
                     suffix = ''
             return tag, suffix, match
     return None, None, None
 
 
 def build_output_filename(input_file, extension, streams, format_info,
-                          norename=False, convert_force=False, output_dir=None):
+                          norename=False, convert_force=False, output_dir=None,
+                          keep_suffix=False):
     directory = output_dir if output_dir else (os.path.dirname(input_file) or '.')
 
     if not os.path.exists(directory):
@@ -188,7 +194,7 @@ def build_output_filename(input_file, extension, streams, format_info,
         name_no_ext = os.path.splitext(basename)[0]
         return os.path.join(directory, f"{name_no_ext}.{extension}")
 
-    tag, suffix, _ = extract_episode_info(basename)
+    tag, suffix, _ = extract_episode_info(basename, keep_suffix=keep_suffix)
     if tag:
         filename = tag + (suffix or '')
     else:
@@ -246,7 +252,7 @@ def determine_best_extension(preferred_extension, selected_subtitle_codecs):
 def process_file(file, extension="mkv", dry_run=False, rename=False, verbose=False,
                  norename=False, convert_force=False,
                  output_dir=None, keep_languages=None, print_fn=None,
-                 progress_fn=None, proc_holder=None, status_fn=None):
+                 progress_fn=None, proc_holder=None, status_fn=None, keep_suffix=False):
     """Process a single video file.
 
     Returns a dict with 'status': 'renamed' | 'remuxed' | 'skipped' | 'failed' | 'dry_run'.
@@ -282,7 +288,8 @@ def process_file(file, extension="mkv", dry_run=False, rename=False, verbose=Fal
                  f"for subtitle compatibility")
 
     output_file = build_output_filename(file, actual_extension, streams, format_info,
-                                        norename, convert_force, output_dir)
+                                        norename, convert_force, output_dir,
+                                        keep_suffix=keep_suffix)
     if not output_file:
         print_fn(f"Skipping {file} as it is already processed")
         return {'status': 'skipped'}
@@ -417,16 +424,15 @@ def process_file(file, extension="mkv", dry_run=False, rename=False, verbose=Fal
     if status_fn:
         status_fn("")
 
-    # Extract and always show the final ffmpeg summary line from stderr
-    # (looks like: frame= 1 fps=0.0 q=-1.0 Lsize= 1KiB time=... speed= Nx)
+    # Extract final stats from stderr for the status label (already shown below progress bar)
     final_stats = ''
     for line in reversed(full_stderr.splitlines()):
         stripped = line.strip()
         if stripped.startswith('frame=') and 'speed=' in stripped:
             final_stats = stripped
             break
-    if final_stats:
-        print_fn(f"  {final_stats}", 'info')
+    if final_stats and status_fn:
+        status_fn(final_stats)
 
     if proc.returncode != 0:
         err_lines = [l.strip() for l in full_stderr.splitlines() if l.strip()]
@@ -440,13 +446,12 @@ def process_file(file, extension="mkv", dry_run=False, rename=False, verbose=Fal
         log_error(file, cmd, full_stderr)
         return {'status': 'failed'}
     else:
-        out_name = os.path.basename(output_file)
-        print_fn(f"  ✓ {os.path.basename(file)}  →  {out_name}", 'keep')
+        print_fn("  ✓ Complete", 'keep')
         return {'status': 'remuxed'}
 
 
 def build_file_plan(file, extension="mkv", norename=False, convert_force=False,
-                    output_dir=None, keep_languages=None):
+                    output_dir=None, keep_languages=None, keep_suffix=False):
     """Return a human-readable diff of what will be done to a file."""
     if keep_languages is None:
         keep_languages = list(DEFAULT_KEEP_LANGUAGES)
@@ -469,7 +474,8 @@ def build_file_plan(file, extension="mkv", norename=False, convert_force=False,
     actual_extension = determine_best_extension(extension, selected_sub_codecs)
 
     output_file = build_output_filename(file, actual_extension, streams, format_info,
-                                        norename, convert_force, output_dir)
+                                        norename, convert_force, output_dir,
+                                        keep_suffix=keep_suffix)
 
     dur = float(format_info.get('duration') or 0)
     total_br = int(format_info.get('bit_rate') or 0)
@@ -766,6 +772,9 @@ def launch_gui(terminal_cwd=None):
                             variable=self.rename_var).pack(anchor=tk.W)
             ttk.Checkbutton(opts_frame, text="Keep Original Filename",
                             variable=self.norename_var).pack(anchor=tk.W)
+            self.keep_suffix_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(opts_frame, text="Keep Episode Suffix",
+                            variable=self.keep_suffix_var).pack(anchor=tk.W)
             ttk.Checkbutton(opts_frame, text="Force Re-process",
                             variable=self.force_var).pack(anchor=tk.W)
             ttk.Checkbutton(opts_frame, text="Verbose Output",
@@ -839,7 +848,7 @@ def launch_gui(terminal_cwd=None):
 
             # Live ffmpeg stats line
             self.status_label = ttk.Label(
-                prog_frame, text="", font=("Consolas", 8),
+                prog_frame, text="", font=("Consolas", 10),
                 foreground='#6a9fd8', anchor=tk.W)
             self.status_label.pack(fill=tk.X, pady=(2, 0))
 
@@ -892,6 +901,7 @@ def launch_gui(terminal_cwd=None):
             path = self.path_var.get().strip()
             self.file_listbox.delete(0, tk.END)
             self._file_paths = []
+            _done_pat = re.compile(r'\[\w+ \d+Mbps \w+\]\.\w+$')
             if self.mode_var.get() == 'folder' and os.path.isdir(path):
                 for f in get_video_files(path):
                     self.file_listbox.insert(tk.END, f"  {os.path.basename(f)}")
@@ -899,6 +909,10 @@ def launch_gui(terminal_cwd=None):
             elif self.mode_var.get() == 'file' and os.path.isfile(path):
                 self.file_listbox.insert(tk.END, f"  {os.path.basename(path)}")
                 self._file_paths.append(path)
+            # Mark already-processed files immediately (no ffprobe needed)
+            for idx, f in enumerate(self._file_paths):
+                if _done_pat.search(os.path.basename(f)):
+                    self._set_file_status(idx, 'done')
 
         def _get_selected_files(self):
             """Return the selected files, or all files if nothing is selected."""
@@ -1029,6 +1043,7 @@ def launch_gui(terminal_cwd=None):
                         convert_force=self.force_var.get(),
                         output_dir=self.output_var.get().strip() or None,
                         keep_languages=languages,
+                        keep_suffix=self.keep_suffix_var.get(),
                     )
                     self._log_plan(plan)
                 except Exception as e:
@@ -1039,6 +1054,8 @@ def launch_gui(terminal_cwd=None):
         def _run(self):
             if self.processing:
                 return
+
+            self._clear_output()
 
             # Use selected files, or all files in the list if nothing is selected
             files = self._get_selected_files()
@@ -1079,6 +1096,7 @@ def launch_gui(terminal_cwd=None):
             verbose = self.verbose_var.get()
             norename = self.norename_var.get()
             force = self.force_var.get()
+            keep_suffix = self.keep_suffix_var.get()
 
             def print_fn(msg, tag=None):
                 self.root.after(0, self._log, msg, tag)
@@ -1103,7 +1121,7 @@ def launch_gui(terminal_cwd=None):
                             plan = build_file_plan(
                                 f, extension=ext_var, norename=norename,
                                 convert_force=force, output_dir=output_dir,
-                                keep_languages=languages,
+                                keep_languages=languages, keep_suffix=keep_suffix,
                             )
                             print_plan(plan)
                         except Exception as pe:
@@ -1130,6 +1148,7 @@ def launch_gui(terminal_cwd=None):
                             convert_force=force,
                             output_dir=output_dir,
                             keep_languages=languages,
+                            keep_suffix=keep_suffix,
                             print_fn=print_fn,
                             progress_fn=make_progress_fn(i + 1),
                             proc_holder=self._proc_holder,
