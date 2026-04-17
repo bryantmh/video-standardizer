@@ -246,7 +246,7 @@ def determine_best_extension(preferred_extension, selected_subtitle_codecs):
 def process_file(file, extension="mkv", dry_run=False, rename=False, verbose=False,
                  norename=False, convert_force=False,
                  output_dir=None, keep_languages=None, print_fn=None,
-                 progress_fn=None, proc_holder=None):
+                 progress_fn=None, proc_holder=None, status_fn=None):
     """Process a single video file.
 
     Returns a dict with 'status': 'renamed' | 'remuxed' | 'skipped' | 'failed' | 'dry_run'.
@@ -316,7 +316,8 @@ def process_file(file, extension="mkv", dry_run=False, rename=False, verbose=Fal
             print_fn(f"Will rename {file} to {output_with_orig}")
             return {'status': 'dry_run'}
 
-    cmd = ['ffmpeg', '-y', '-progress', 'pipe:1', '-nostats', '-i', file]
+    cmd = ['ffmpeg', '-y', '-progress', 'pipe:1', '-nostats',
+           '-fflags', '+genpts', '-i', file]
 
     has_external_sub = bool(subtitle_file and not subtitle_selection)
     if has_external_sub:
@@ -347,13 +348,9 @@ def process_file(file, extension="mkv", dry_run=False, rename=False, verbose=Fal
 
     cmd.append(output_file)
 
-    audio_desc = ", ".join(f"{l}(idx={i})" for i, l, _ in audio_selection)
-    print_fn(f"Processing: {os.path.basename(file)}")
-    print_fn(f"  Audio: [{audio_desc}] | Subtitles: {subtitle_selection}")
-    print_fn(f"  Output: {output_file}")
-
     if dry_run:
-        print_fn(f"  CMD: {' '.join(cmd)}")
+        if verbose:
+            print_fn(f"  CMD: {' '.join(cmd)}")
         return {'status': 'dry_run'}
 
     if verbose:
@@ -361,6 +358,8 @@ def process_file(file, extension="mkv", dry_run=False, rename=False, verbose=Fal
 
     if progress_fn:
         progress_fn(0)
+    if status_fn:
+        status_fn("")
 
     proc = subprocess.Popen(
         cmd,
@@ -381,27 +380,68 @@ def process_file(file, extension="mkv", dry_run=False, rename=False, verbose=Fal
     stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
     stderr_thread.start()
 
+    _prog = {}
     for line in proc.stdout:
         line = line.strip()
-        if line.startswith('out_time_us=') and progress_fn and duration > 0:
-            try:
-                us = int(line.split('=', 1)[1])
-                pct = min(99.0, (us / 1_000_000) / duration * 100)
-                progress_fn(pct)
-            except (ValueError, ZeroDivisionError):
-                pass
+        if '=' in line:
+            k, _, v = line.partition('=')
+            _prog[k] = v
+        if line.startswith('progress='):
+            if progress_fn and duration > 0 and 'out_time_us' in _prog:
+                try:
+                    us = int(_prog['out_time_us'])
+                    pct = min(99.0, (us / 1_000_000) / duration * 100)
+                    progress_fn(pct)
+                except (ValueError, ZeroDivisionError):
+                    pass
+            if status_fn or verbose:
+                parts = []
+                for key in ('frame', 'fps', 'out_time', 'speed'):
+                    val = _prog.get(key, '')
+                    if val and val not in ('N/A', '0.00', '0.00x', ''):
+                        label = 'time' if key == 'out_time' else key
+                        if key == 'out_time':
+                            val = val[:8]
+                        parts.append(f"{label}={val}")
+                stat_line = '  '.join(parts)
+                if stat_line and status_fn:
+                    status_fn(stat_line)
+                if verbose and stat_line:
+                    print_fn(f"  {stat_line}")
+            _prog = {}
 
     proc.wait()
     stderr_thread.join(timeout=5)
     full_stderr = ''.join(stderr_data)
 
+    if status_fn:
+        status_fn("")
+
+    # Extract and always show the final ffmpeg summary line from stderr
+    # (looks like: frame= 1 fps=0.0 q=-1.0 Lsize= 1KiB time=... speed= Nx)
+    final_stats = ''
+    for line in reversed(full_stderr.splitlines()):
+        stripped = line.strip()
+        if stripped.startswith('frame=') and 'speed=' in stripped:
+            final_stats = stripped
+            break
+    if final_stats:
+        print_fn(f"  {final_stats}", 'info')
+
     if proc.returncode != 0:
-        print_fn(f"  ERROR: {full_stderr[:500]}")
-        print_fn(f"  Details written to: {ERROR_LOG}")
+        err_lines = [l.strip() for l in full_stderr.splitlines() if l.strip()]
+        brief = next(
+            (l for l in reversed(err_lines)
+             if any(kw in l.lower() for kw in ('error', 'invalid', 'failed', 'no such', 'unable'))),
+            err_lines[-1] if err_lines else 'Unknown error'
+        )
+        print_fn(f"  ✗ Failed: {brief}", 'drop')
+        print_fn(f"    (full details → {os.path.basename(ERROR_LOG)})", 'warn')
         log_error(file, cmd, full_stderr)
         return {'status': 'failed'}
     else:
-        print_fn(f"  Done.")
+        out_name = os.path.basename(output_file)
+        print_fn(f"  ✓ {os.path.basename(file)}  →  {out_name}", 'keep')
         return {'status': 'remuxed'}
 
 
@@ -431,17 +471,25 @@ def build_file_plan(file, extension="mkv", norename=False, convert_force=False,
     output_file = build_output_filename(file, actual_extension, streams, format_info,
                                         norename, convert_force, output_dir)
 
-    SEP = '─' * 54
-    lines = [SEP, f"File:   {os.path.basename(file)}"]
+    dur = float(format_info.get('duration') or 0)
+    total_br = int(format_info.get('bit_rate') or 0)
+    dur_str = f"{int(dur//3600):02d}:{int((dur%3600)//60):02d}:{int(dur%60):02d}"
+    br_str = f"{total_br/1_000_000:.1f} Mbps" if total_br else "?"
+
+    SEP = '─' * 58
+    lines = []
 
     if not output_file:
-        lines.append("Output: (skip — already processed)")
+        lines.append("Output:   (skip — already processed)")
         lines.append(SEP)
         return "\n".join(lines)
 
     out_name = os.path.basename(output_file)
     in_name = os.path.basename(file)
-    lines.append(f"Output: {out_name}" if out_name != in_name else "Output: (same name)")
+    lines.append(f"Output:   {out_name}" if out_name != in_name else "Output:   (same name)")
+
+    lines.append(f"File:     {os.path.basename(file)}")
+    lines.append(f"Duration: {dur_str}   Total bitrate: {br_str}")
 
     if actual_extension != extension:
         lines.append(f"Container: {extension.upper()} → {actual_extension.upper()}"
@@ -450,22 +498,32 @@ def build_file_plan(file, extension="mkv", norename=False, convert_force=False,
         lines.append(f"Container: {actual_extension.upper()}")
     lines.append("")
 
+    def _stream_br(stream):
+        br = int(stream.get('bit_rate') or 0)
+        if not br:
+            return ''
+        if br >= 1_000_000:
+            return f"  {br/1_000_000:.1f}Mbps"
+        return f"  {br//1000}kbps"
+
     for s in video_streams_all:
         codec = s.get('codec_name', '?').upper()
         w, h = s.get('width', '?'), s.get('height', '?')
-        lines.append(f"  ✓ Video    [{codec:>6}]  {w}x{h}  →  copy")
+        br_note = _stream_br(s)
+        lines.append(f"  ✓ Video    [{codec:>6}]  {w}x{h}{br_note}  →  copy")
 
     audio_kept = {a[0]: a for a in audio_selection}
     for i, s in enumerate(audio_streams_all):
         lang = s.get('tags', {}).get('language', 'und')
         codec = s.get('codec_name', '?').upper()
         ch = s.get('channels', '?')
+        br_note = _stream_br(s)
         if i in audio_kept:
             _, new_lang, changed = audio_kept[i]
             tag_note = f"  [tag: {lang}→{new_lang}]" if changed else ""
-            lines.append(f"  ✓ Audio    [{codec:>6}]  {ch}ch  lang={lang}{tag_note}  →  copy")
+            lines.append(f"  ✓ Audio    [{codec:>6}]  {ch}ch{br_note}  lang={lang}{tag_note}  →  copy")
         else:
-            lines.append(f"  ✗ Audio    [{codec:>6}]  {ch}ch  lang={lang}  →  DROP")
+            lines.append(f"  ✗ Audio    [{codec:>6}]  {ch}ch{br_note}  lang={lang}  →  DROP")
 
     for i, s in enumerate(subtitle_streams_all):
         lang = s.get('tags', {}).get('language', 'und')
@@ -476,43 +534,6 @@ def build_file_plan(file, extension="mkv", norename=False, convert_force=False,
             lines.append(f"  ✓ Sub      [{codec:>20}]  {label}  →  copy")
         else:
             lines.append(f"  ✗ Sub      [{codec:>20}]  {label}  →  DROP")
-
-    lines.append(SEP)
-    return "\n".join(lines)
-
-
-def format_stream_info(file):
-    """Return a human-readable stream info string for a file."""
-    probe = get_all_streams(file)
-    streams = probe.get('streams', [])
-    fmt = probe.get('format', {})
-
-    SEP = '─' * 54
-    lines = [SEP, f"Stream Info: {os.path.basename(file)}"]
-
-    dur = float(fmt.get('duration') or 0)
-    br = int(fmt.get('bit_rate') or 0) // 1000
-    lines.append(f"Duration: {int(dur//3600):02d}:{int((dur%3600)//60):02d}:{dur%60:05.2f}")
-    lines.append(f"Bitrate:  {br} kb/s")
-    lines.append("")
-
-    for s in streams:
-        stype = s.get('codec_type', '?')
-        codec = s.get('codec_name', '?')
-        lang = s.get('tags', {}).get('language', 'und')
-        title = s.get('tags', {}).get('title', '')
-        idx = s.get('index', '?')
-        if stype == 'video':
-            lines.append(f"  [{idx}] Video    {codec.upper():>8}  "
-                         f"{s.get('width', '?')}x{s.get('height', '?')}")
-        elif stype == 'audio':
-            ch = s.get('channels', '?')
-            lines.append(f"  [{idx}] Audio    {codec.upper():>8}  {ch}ch  "
-                         f"lang={lang}  {title}")
-        elif stype == 'subtitle':
-            lines.append(f"  [{idx}] Subtitle {codec:>20}  lang={lang}  {title}")
-        else:
-            lines.append(f"  [{idx}] {stype}")
 
     lines.append(SEP)
     return "\n".join(lines)
@@ -609,11 +630,71 @@ def launch_gui(terminal_cwd=None):
             self.root.drop_target_register(DND_FILES)
             self.root.dnd_bind('<<Drop>>', self._on_drop)
 
+            # ── Dark mode colours ────────────────────────────────────────
+            _BG  = '#1e1e1e'
+            _BG2 = '#252526'
+            _FG  = '#cccccc'
+            _SEL = '#0078d4'
+            _ENT = '#3c3c3c'
+            _BOR = '#555555'
+            self.root.configure(bg=_BG)
+            # Dark title bar on Windows 10/11
+            self.root.after(20, self._apply_dark_titlebar)
+
             style = ttk.Style()
-            try:
-                style.theme_use('vista')
-            except Exception:
-                pass
+            style.theme_use('clam')
+            style.configure('.',
+                background=_BG, foreground=_FG,
+                bordercolor=_BOR, focuscolor=_SEL, troughcolor=_BG2)
+            style.configure('TFrame',           background=_BG)
+            style.configure('TLabel',           background=_BG,  foreground=_FG)
+            style.configure('TLabelframe',      background=_BG,  foreground=_FG,
+                bordercolor=_BOR)
+            style.configure('TLabelframe.Label', background=_BG, foreground=_FG)
+            style.configure('TButton',
+                background=_ENT, foreground=_FG,
+                bordercolor=_BOR, relief='flat', padding=4)
+            style.map('TButton',
+                background=[('active', '#4c4c4c'), ('pressed', _SEL)],
+                foreground=[('active', _FG)])
+            style.configure('TEntry',
+                fieldbackground=_ENT, foreground=_FG,
+                insertcolor=_FG, bordercolor=_BOR,
+                selectbackground=_SEL, selectforeground=_FG)
+            style.configure('TRadiobutton',
+                background=_BG, foreground=_FG, focuscolor=_BG,
+                indicatorcolor=_ENT, indicatorbackground=_ENT)
+            style.map('TRadiobutton',
+                background=[('active', _BG)],
+                indicatorcolor=[('selected', _SEL)])
+            style.configure('TCheckbutton',
+                background=_BG, foreground=_FG, focuscolor=_BG,
+                indicatorcolor=_ENT, indicatorbackground=_ENT)
+            style.map('TCheckbutton',
+                background=[('active', _BG)],
+                indicatorcolor=[('selected', _SEL)])
+            style.configure('TPanedwindow',   background=_BOR)
+            style.configure('Sash',           sashthickness=4, background=_BOR)
+            style.configure('Horizontal.TProgressbar',
+                troughcolor=_ENT, background=_SEL,
+                bordercolor=_BOR, lightcolor=_SEL, darkcolor=_SEL)
+            style.configure('Vertical.TScrollbar',
+                troughcolor=_BG2, background=_ENT,
+                bordercolor=_BOR, arrowcolor=_FG)
+            style.configure('Horizontal.TScrollbar',
+                troughcolor=_BG2, background=_ENT,
+                bordercolor=_BOR, arrowcolor=_FG)
+            # Accent style for primary action button
+            _ACC = '#0e639c'
+            style.configure('Accent.TButton',
+                background=_ACC, foreground='#ffffff',
+                bordercolor='#1177bb', relief='flat', padding=4)
+            style.map('Accent.TButton',
+                background=[('active', '#1177bb'), ('pressed', '#094771'),
+                            ('disabled', '#3a3a3a')],
+                foreground=[('disabled', '#777777')])
+            # Section headers — soft blue tint
+            style.configure('TLabelframe.Label', background=_BG, foreground='#9ec9f5')
 
             # ── Main horizontal split ────────────────────────────────────
             main_pane = ttk.PanedWindow(root, orient=tk.HORIZONTAL)
@@ -693,7 +774,8 @@ def launch_gui(terminal_cwd=None):
             # Action buttons
             btn_frame = ttk.Frame(left_frame, padding=5)
             btn_frame.pack(fill=tk.X, padx=5, pady=5)
-            self.run_btn = ttk.Button(btn_frame, text="Run", command=self._run)
+            self.run_btn = ttk.Button(btn_frame, text="Run", command=self._run,
+                                       style='Accent.TButton')
             self.run_btn.pack(fill=tk.X, pady=(0, 3))
             self.stop_btn = ttk.Button(btn_frame, text="Stop", command=self._stop,
                                        state=tk.DISABLED)
@@ -716,7 +798,7 @@ def launch_gui(terminal_cwd=None):
             list_scroll = ttk.Scrollbar(list_inner, orient=tk.VERTICAL)
             self.file_listbox = tk.Listbox(
                 list_inner, yscrollcommand=list_scroll.set,
-                font=("Consolas", 9), selectmode=tk.SINGLE,
+                font=("Consolas", 9), selectmode=tk.MULTIPLE,
                 bg="#252526", fg="#cccccc", selectbackground="#0078d4",
                 activestyle='none', height=7
             )
@@ -726,10 +808,10 @@ def launch_gui(terminal_cwd=None):
 
             list_btn_row = ttk.Frame(list_frame)
             list_btn_row.pack(fill=tk.X, padx=5, pady=(0, 5))
-            ttk.Button(list_btn_row, text="Stream Info",
-                       command=self._show_stream_info).pack(side=tk.LEFT, padx=(0, 4))
             ttk.Button(list_btn_row, text="Show Plan",
-                       command=self._show_plan).pack(side=tk.LEFT)
+                       command=self._show_plan).pack(side=tk.LEFT, padx=(0, 4))
+            ttk.Button(list_btn_row, text="Clear Selection",
+                       command=self._clear_selection).pack(side=tk.LEFT)
 
             # ── BOTTOM: Progress + Output ────────────────────────────────
             bottom_frame = ttk.Frame(right_pane)
@@ -755,6 +837,12 @@ def launch_gui(terminal_cwd=None):
             self.batch_lbl = ttk.Label(row2, text="", width=6, anchor=tk.E)
             self.batch_lbl.pack(side=tk.LEFT, padx=(4, 0))
 
+            # Live ffmpeg stats line
+            self.status_label = ttk.Label(
+                prog_frame, text="", font=("Consolas", 8),
+                foreground='#6a9fd8', anchor=tk.W)
+            self.status_label.pack(fill=tk.X, pady=(2, 0))
+
             # Output text
             self.output_text = scrolledtext.ScrolledText(
                 bottom_frame, wrap=tk.WORD, font=("Consolas", 9),
@@ -774,6 +862,22 @@ def launch_gui(terminal_cwd=None):
 
             # Initial file list population
             self._on_path_change()
+
+        def _apply_dark_titlebar(self):
+            try:
+                import ctypes
+                self.root.update()  # ensure Win32 window exists
+                child_hwnd = self.root.winfo_id()
+                # GA_ROOT=2 walks up to the actual top-level frame window
+                hwnd = ctypes.windll.user32.GetAncestor(child_hwnd, 2)
+                if not hwnd:
+                    hwnd = child_hwnd
+                for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (Win11=20, Win10=19)
+                    ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                        hwnd, attr, ctypes.byref(ctypes.c_int(1)),
+                        ctypes.sizeof(ctypes.c_int))
+            except Exception:
+                pass
 
         # ── Path / file list helpers ─────────────────────────────────────
 
@@ -796,12 +900,15 @@ def launch_gui(terminal_cwd=None):
                 self.file_listbox.insert(tk.END, f"  {os.path.basename(path)}")
                 self._file_paths.append(path)
 
-        def _get_selected_file(self):
+        def _get_selected_files(self):
+            """Return the selected files, or all files if nothing is selected."""
             sel = self.file_listbox.curselection()
-            if not sel:
-                return None
-            idx = sel[0]
-            return self._file_paths[idx] if idx < len(self._file_paths) else None
+            if sel:
+                return [self._file_paths[i] for i in sel if i < len(self._file_paths)]
+            return list(self._file_paths)
+
+        def _clear_selection(self):
+            self.file_listbox.selection_clear(0, tk.END)
 
         def _set_file_status(self, index, status):
             icons  = {'pending': '  ', 'running': '⟳ ', 'done': '✓ ',
@@ -886,6 +993,9 @@ def launch_gui(terminal_cwd=None):
             self.output_text.see(tk.END)
             self.output_text.configure(state=tk.DISABLED)
 
+        def _update_status(self, text):
+            self.status_label.configure(text=text)
+
         def _clear_output(self):
             self.output_text.configure(state=tk.NORMAL)
             self.output_text.delete("1.0", tk.END)
@@ -908,35 +1018,21 @@ def launch_gui(terminal_cwd=None):
 
         # ── Inline stream info & plan (no popup windows) ────────────────
 
-        def _show_stream_info(self):
-            f = self._get_selected_file()
-            if not f:
-                self._log("Select a file in the list first.")
-                return
-            try:
-                info = format_stream_info(f)
-                self._log_plan(info)
-            except Exception as e:
-                self._log(f"Error reading stream info: {e}")
-
         def _show_plan(self):
-            f = self._get_selected_file()
-            if not f:
-                self._log("Select a file in the list first.")
-                return
             languages = self.lang_var.get().strip().split() or list(DEFAULT_KEEP_LANGUAGES)
-            try:
-                plan = build_file_plan(
-                    f,
-                    extension=self.extension_var.get(),
-                    norename=self.norename_var.get(),
-                    convert_force=self.force_var.get(),
-                    output_dir=self.output_var.get().strip() or None,
-                    keep_languages=languages,
-                )
-                self._log_plan(plan)
-            except Exception as e:
-                self._log(f"Error building plan: {e}")
+            for f in self._get_selected_files():
+                try:
+                    plan = build_file_plan(
+                        f,
+                        extension=self.extension_var.get(),
+                        norename=self.norename_var.get(),
+                        convert_force=self.force_var.get(),
+                        output_dir=self.output_var.get().strip() or None,
+                        keep_languages=languages,
+                    )
+                    self._log_plan(plan)
+                except Exception as e:
+                    self._log(f"Error building plan for {os.path.basename(f)}: {e}")
 
         # ── Run / Stop ───────────────────────────────────────────────────
 
@@ -944,31 +1040,27 @@ def launch_gui(terminal_cwd=None):
             if self.processing:
                 return
 
-            path = self.path_var.get().strip()
-            if not path:
-                self._log("ERROR: No input path specified.")
+            # Use selected files, or all files in the list if nothing is selected
+            files = self._get_selected_files()
+            if not files:
+                self._log("No video files to process.")
                 return
 
-            if self.mode_var.get() == "folder":
-                files = get_video_files(path)
-                if not files:
-                    self._log(f"No video files found in: {path}")
-                    return
-            else:
-                if not os.path.isfile(path):
-                    self._log(f"File not found: {path}")
-                    return
-                files = [path]
+            path = self.path_var.get().strip()
 
             # Persist the folder for next launch
             run_cfg = load_config()
             run_cfg['last_folder'] = path if self.mode_var.get() == 'folder' else os.path.dirname(path)
             save_config(run_cfg)
 
-            # Refresh file list and reset all status icons
-            self._on_path_change()
-            for i in range(len(self._file_paths)):
-                self._set_file_status(i, 'pending')
+            # Map file path → listbox index for live status updates
+            file_to_lb_idx = {f: idx for idx, f in enumerate(self._file_paths)}
+
+            # Mark queued files as pending
+            for f in files:
+                lb_idx = file_to_lb_idx.get(f, -1)
+                if lb_idx >= 0:
+                    self._set_file_status(lb_idx, 'pending')
 
             languages = self.lang_var.get().strip().split() or list(DEFAULT_KEEP_LANGUAGES)
             output_dir = self.output_var.get().strip() or None
@@ -1003,7 +1095,9 @@ def launch_gui(terminal_cwd=None):
                             print_fn("--- Stopped by user ---")
                             break
 
-                        self.root.after(0, self._set_file_status, i, 'running')
+                        lb_idx = file_to_lb_idx.get(f, -1)
+                        if lb_idx >= 0:
+                            self.root.after(0, self._set_file_status, lb_idx, 'running')
 
                         try:
                             plan = build_file_plan(
@@ -1021,6 +1115,11 @@ def launch_gui(terminal_cwd=None):
                                     0, self._update_progress, pct, file_idx, total)
                             return _pfn
 
+                        def make_status_fn():
+                            def _sfn(stats):
+                                self.root.after(0, self._update_status, stats)
+                            return _sfn
+
                         result = process_file(
                             f,
                             extension=ext_var,
@@ -1034,6 +1133,7 @@ def launch_gui(terminal_cwd=None):
                             print_fn=print_fn,
                             progress_fn=make_progress_fn(i + 1),
                             proc_holder=self._proc_holder,
+                            status_fn=make_status_fn(),
                         )
 
                         status = (result or {}).get('status', 'skipped')
@@ -1042,7 +1142,8 @@ def launch_gui(terminal_cwd=None):
                                 'renamed' if status == 'renamed' else
                                 'skipped' if status in ('skipped', 'dry_run') else
                                 'failed')
-                        self.root.after(0, self._set_file_status, i, icon)
+                        if lb_idx >= 0:
+                            self.root.after(0, self._set_file_status, lb_idx, icon)
                         self.root.after(0, self._update_progress, 100, i + 1, total)
 
                     if not self._stop_flag:
@@ -1080,6 +1181,7 @@ def launch_gui(terminal_cwd=None):
             self.processing = False
             self.run_btn.configure(state=tk.NORMAL)
             self.stop_btn.configure(state=tk.DISABLED)
+            self.status_label.configure(text="")
 
     root = TkinterDnD.Tk()
     VideoStandardizerGUI(root)
