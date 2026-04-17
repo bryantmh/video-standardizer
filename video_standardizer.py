@@ -473,6 +473,12 @@ def build_file_plan(file, extension="mkv", norename=False, convert_force=False,
     selected_sub_codecs = [subtitle_streams_all[i].get('codec_name', '') for i in subtitle_selection]
     actual_extension = determine_best_extension(extension, selected_sub_codecs)
 
+    # Check for external subtitle file alongside the video
+    _base = os.path.splitext(file)[0]
+    external_sub = next(
+        ((_base + ext) for ext in ('.en.srt', '.eng.srt', '.srt', '.sub')
+         if os.path.exists(_base + ext)), None)
+
     output_file = build_output_filename(file, actual_extension, streams, format_info,
                                         norename, convert_force, output_dir,
                                         keep_suffix=keep_suffix)
@@ -540,6 +546,9 @@ def build_file_plan(file, extension="mkv", norename=False, convert_force=False,
             lines.append(f"  ✓ Sub      [{codec:>20}]  {label}  →  copy")
         else:
             lines.append(f"  ✗ Sub      [{codec:>20}]  {label}  →  DROP")
+
+    if external_sub:
+        lines.append(f"  ✓ Sub      [{'external':>20}]  {os.path.basename(external_sub)}  →  embed")
 
     lines.append(SEP)
     return "\n".join(lines)

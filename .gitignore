@@ -3,3 +3,5 @@
 CrystalDiskInfo/*
 CrystalDiskMark/*
 __pycache__/
+*.log
+video_standardizer_config.json
