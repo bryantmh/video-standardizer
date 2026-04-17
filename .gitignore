@@ -2,3 +2,4 @@
 *.mkv
 CrystalDiskInfo/*
 CrystalDiskMark/*
+__pycache__/
