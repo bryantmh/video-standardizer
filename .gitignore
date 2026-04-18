@@ -5,3 +5,4 @@ CrystalDiskMark/*
 __pycache__/
 *.log
 video_standardizer_config.json
+video-standardizer.code-workspace

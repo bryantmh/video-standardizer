@@ -27,13 +27,6 @@ It works well for processing downloaded TV episodes and movies that arrive in in
 | Package | Purpose | Required? |
 |---------|---------|----------|
 | [`tkinterdnd2`](https://pypi.org/project/tkinterdnd2/) | Drag-and-drop files/folders onto the GUI input field | **Required** |
-| [`prompt_toolkit`](https://python-prompt-toolkit.readthedocs.io/) | Tab-completion in CLI interactive mode | Optional — auto-installed on first use |
-
-Install:
-
-```
-pip install tkinterdnd2
-```
 
 ## Installation
 
@@ -42,6 +35,7 @@ No installation required. Clone or download the repository and run the script di
 ```
 git clone https://github.com/yourname/video-standardizer.git
 cd video-standardizer
+pip install tkinterdnd2
 ```
 
 Ensure `ffmpeg` and `ffprobe` are available:
