@@ -178,7 +178,7 @@ def extract_episode_info(filename, keep_suffix=False):
 
 def build_output_filename(input_file, extension, streams, format_info,
                           norename=False, convert_force=False, output_dir=None,
-                          keep_suffix=False):
+                          keep_suffix=False, tvdb_changes=None):
     directory = output_dir if output_dir else (os.path.dirname(input_file) or '.')
 
     if not os.path.exists(directory):
@@ -194,7 +194,17 @@ def build_output_filename(input_file, extension, streams, format_info,
         name_no_ext = os.path.splitext(basename)[0]
         return os.path.join(directory, f"{name_no_ext}.{extension}")
 
-    tag, suffix, _ = extract_episode_info(basename, keep_suffix=keep_suffix)
+    tc = tvdb_changes or {}
+
+    # Use TVDB sxxexx if provided, otherwise extract from filename
+    if tc.get('sxxexx'):
+        tag = tc['sxxexx']
+        suffix = tc.get('episode_title', '') or ''
+    else:
+        tag, suffix, _ = extract_episode_info(basename, keep_suffix=keep_suffix)
+        if tag and tc.get('episode_title'):
+            suffix = tc['episode_title']
+
     if tag:
         filename = tag + (suffix or '')
     else:
@@ -203,6 +213,11 @@ def build_output_filename(input_file, extension, streams, format_info,
     resolution = get_resolution(streams)
     bitrate = get_bitrate(format_info)
     encoding = get_encoding(streams)
+
+    # Insert year before metadata tag if provided by TVDB
+    if tc.get('year'):
+        filename += f" ({tc['year']})"
+
     parts = []
     if resolution:
         parts.append(resolution)
@@ -252,7 +267,8 @@ def determine_best_extension(preferred_extension, selected_subtitle_codecs):
 def process_file(file, extension="mkv", dry_run=False, rename=False, verbose=False,
                  norename=False, convert_force=False,
                  output_dir=None, keep_languages=None, print_fn=None,
-                 progress_fn=None, proc_holder=None, status_fn=None, keep_suffix=False):
+                 progress_fn=None, proc_holder=None, status_fn=None, keep_suffix=False,
+                 tvdb_changes=None):
     """Process a single video file.
 
     Returns a dict with 'status': 'renamed' | 'remuxed' | 'skipped' | 'failed' | 'dry_run'.
@@ -289,7 +305,8 @@ def process_file(file, extension="mkv", dry_run=False, rename=False, verbose=Fal
 
     output_file = build_output_filename(file, actual_extension, streams, format_info,
                                         norename, convert_force, output_dir,
-                                        keep_suffix=keep_suffix)
+                                        keep_suffix=keep_suffix,
+                                        tvdb_changes=tvdb_changes)
     if not output_file:
         print_fn(f"Skipping {file} as it is already processed")
         return {'status': 'skipped'}
@@ -451,7 +468,8 @@ def process_file(file, extension="mkv", dry_run=False, rename=False, verbose=Fal
 
 
 def build_file_plan(file, extension="mkv", norename=False, convert_force=False,
-                    output_dir=None, keep_languages=None, keep_suffix=False):
+                    output_dir=None, keep_languages=None, keep_suffix=False,
+                    tvdb_changes=None):
     """Return a human-readable diff of what will be done to a file."""
     if keep_languages is None:
         keep_languages = list(DEFAULT_KEEP_LANGUAGES)
@@ -481,7 +499,8 @@ def build_file_plan(file, extension="mkv", norename=False, convert_force=False,
 
     output_file = build_output_filename(file, actual_extension, streams, format_info,
                                         norename, convert_force, output_dir,
-                                        keep_suffix=keep_suffix)
+                                        keep_suffix=keep_suffix,
+                                        tvdb_changes=tvdb_changes)
 
     dur = float(format_info.get('duration') or 0)
     total_br = int(format_info.get('bit_rate') or 0)
@@ -639,6 +658,7 @@ def launch_gui(terminal_cwd=None):
             self._stop_flag = False
             self._proc_holder = {}
             self._file_paths = []
+            self._tvdb_changes = {}  # filepath -> {year, sxxexx, episode_title}
 
             # Register the root window as a drop target so the whole app
             # accepts file/folder drops, not just the path entry field.
@@ -828,6 +848,8 @@ def launch_gui(terminal_cwd=None):
             list_btn_row.pack(fill=tk.X, padx=5, pady=(0, 5))
             ttk.Button(list_btn_row, text="Show Plan",
                        command=self._show_plan).pack(side=tk.LEFT, padx=(0, 4))
+            ttk.Button(list_btn_row, text="TVDB Lookup",
+                       command=self._tvdb_lookup).pack(side=tk.LEFT, padx=(0, 4))
             ttk.Button(list_btn_row, text="Clear Selection",
                        command=self._clear_selection).pack(side=tk.LEFT)
 
@@ -1053,10 +1075,30 @@ def launch_gui(terminal_cwd=None):
                         output_dir=self.output_var.get().strip() or None,
                         keep_languages=languages,
                         keep_suffix=self.keep_suffix_var.get(),
+                        tvdb_changes=self._tvdb_changes.get(f),
                     )
                     self._log_plan(plan)
                 except Exception as e:
                     self._log(f"Error building plan for {os.path.basename(f)}: {e}")
+
+        def _tvdb_lookup(self):
+            files = self._get_selected_files()
+            if not files:
+                self._log("No files selected for TVDB lookup.")
+                return
+            from tvdb_lookup import build_tvdb_popup
+
+            def _apply_cb(filepath, changes):
+                self._tvdb_changes[filepath] = changes
+                self._log(f"TVDB changes queued for {os.path.basename(filepath)}:", 'info')
+                if changes.get('year'):
+                    self._log(f"  Year: ({changes['year']})", 'keep')
+                if changes.get('sxxexx'):
+                    self._log(f"  Episode ID: {changes['sxxexx']}", 'keep')
+                if changes.get('episode_title'):
+                    self._log(f"  Episode Title: {changes['episode_title']}", 'keep')
+
+            build_tvdb_popup(self.root, files, _apply_cb)
 
         # ── Run / Stop ───────────────────────────────────────────────────
 
@@ -1131,6 +1173,7 @@ def launch_gui(terminal_cwd=None):
                                 f, extension=ext_var, norename=norename,
                                 convert_force=force, output_dir=output_dir,
                                 keep_languages=languages, keep_suffix=keep_suffix,
+                                tvdb_changes=self._tvdb_changes.get(f),
                             )
                             print_plan(plan)
                         except Exception as pe:
@@ -1162,6 +1205,7 @@ def launch_gui(terminal_cwd=None):
                             progress_fn=make_progress_fn(i + 1),
                             proc_holder=self._proc_holder,
                             status_fn=make_status_fn(),
+                            tvdb_changes=self._tvdb_changes.get(f),
                         )
 
                         status = (result or {}).get('status', 'skipped')
