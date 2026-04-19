@@ -214,6 +214,9 @@ def build_output_filename(input_file, extension, streams, format_info,
     bitrate = get_bitrate(format_info)
     encoding = get_encoding(streams)
 
+    # Strip any existing metadata tag so force-reprocess doesn't double it
+    filename = re.sub(r'\s*\[\w+\s+\d+Mbps\s+\w+\]', '', filename).rstrip()
+
     # Insert year before metadata tag if provided by TVDB
     if tc.get('year'):
         filename += f" ({tc['year']})"
