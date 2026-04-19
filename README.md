@@ -12,11 +12,10 @@ It works well for processing downloaded TV episodes and movies that arrive in in
 - **No-audio-drop safety** — if language filtering would eliminate all audio tracks, all tracks are kept instead
 - **Episode renaming** — parses and normalizes episode tags including multi-episode formats (`S01E01E02`, `S01E01-02`, `S01E01-E02`)
 - **Metadata filename tags** — appends `[HD 8Mbps HEVC]`-style labels to output filenames
-- **Container fallback** — automatically switches to the most compatible container for subtitle streams to avoid re-encoding (e.g. PGS subtitles always go to MKV)
 - **External subtitle support** — automatically picks up `.en.srt`, `.eng.srt`, `.srt`, or `.sub` sidecar files and embeds them
 - **Error logging** — failed conversions are written to `conversion_errors.log` with the full ffmpeg error for later review
 - **GUI and CLI modes** — full Tkinter GUI with live output, or fully scriptable from the command line
-- **TVDB integration** — look up series year, correct episode IDs (`S01E01`), and proper episode titles directly from [TheTVDB](https://thetvdb.com), with support for multiple season orderings (Aired, DVD, Absolute, etc.)
+- **TVDB integration** — look up and apply series year, correct episode IDs (`S01E01`), and proper episode titles directly from [TheTVDB](https://thetvdb.com), with support for multiple season orderings (Aired, DVD, Absolute, etc.)
 
 ## Requirements
 
@@ -28,7 +27,6 @@ It works well for processing downloaded TV episodes and movies that arrive in in
 | Package | Purpose | Required? |
 |---------|---------|----------|
 | [`tkinterdnd2`](https://pypi.org/project/tkinterdnd2/) | Drag-and-drop files/folders onto the GUI input field | **Required** |
-| [`requests`](https://pypi.org/project/requests/) | (not used — TVDB calls use stdlib `urllib`) | — |
 
 A free [TheTVDB](https://thetvdb.com) account and API key are required to use TVDB features. See [TVDB Setup](#tvdb-setup) below.
 
@@ -123,7 +121,7 @@ python video_standardizer.py
 
 ## GUI Options
 
-The GUI exposes additional options not available on the CLI:
+The GUI exposes slightly different options than the CLI:
 
 | Option | Description |
 |--------|-------------|
