@@ -632,18 +632,16 @@ def build_tvdb_popup(parent, filepaths, apply_callback):
     _BG2 = '#252526'
     _BG3 = '#2d2d2d'
     _FG = '#cccccc'
-    _FG_DIM = '#808080'
+    _FG_DIM = '#606060'
     _SEL = '#0078d4'
     _ENT = '#3c3c3c'
     _GREEN = '#4ec994'
     _YELLOW = '#dcdcaa'
     _RED = '#f14c4c'
-    _BLUE = '#9cdcfe'
-    _PURPLE = '#c586c0'
 
     popup = tk.Toplevel(parent)
     popup.title("TVDB Lookup")
-    popup.geometry("1100x700")
+    popup.geometry("1200x700")
     popup.minsize(900, 400)
     popup.configure(bg=_BG)
     popup.transient(parent)
@@ -661,28 +659,88 @@ def build_tvdb_popup(parent, filepaths, apply_callback):
         pass
 
     # ── State ────────────────────────────────────────────────────
-    global_year = tk.BooleanVar(value=False)    # Year OFF by default
-    global_mode = tk.StringVar(value='ep_id')   # 'ep_id' or 'ep_title'
-    select_all_var = tk.BooleanVar(value=True)
-    rows = []  # per-file row dicts
+    global_year = tk.BooleanVar(value=False)   # Year OFF by default
+    global_mode = tk.StringVar(value='ep_id')  # 'ep_id' or 'ep_title'
+    global_ordering = tk.StringVar(value='')   # '' = best auto
+    row_data_list = []       # list of dicts (one per file)
+    row_selected = {}        # iid -> bool
 
-    def _score_color(score):
-        if score >= 0.8:
-            return _GREEN
-        if score >= 0.6:
-            return _YELLOW
-        return _RED
+    # ── ttk Style ────────────────────────────────────────────────
+    style = ttk.Style(popup)
+    style.theme_use('clam')
+    style.configure('TVDB.Treeview',
+        background=_BG2, foreground=_FG, fieldbackground=_BG2,
+        rowheight=22, font=('Consolas', 9),
+        borderwidth=0, relief='flat')
+    style.configure('TVDB.Treeview.Heading',
+        background=_BG3, foreground=_FG,
+        font=('Consolas', 9, 'bold'),
+        relief='flat', borderwidth=1)
+    style.map('TVDB.Treeview',
+        background=[('selected', _SEL)],
+        foreground=[('selected', '#ffffff')])
+    style.map('TVDB.Treeview.Heading',
+        background=[('active', _ENT)])
+    style.configure('TCombobox',
+        fieldbackground=_ENT, background=_ENT,
+        foreground=_FG, selectbackground=_SEL,
+        selectforeground='#ffffff', arrowcolor=_FG)
+    style.map('TCombobox',
+        fieldbackground=[('readonly', _ENT)],
+        background=[('readonly', _ENT)],
+        foreground=[('readonly', _FG)])
 
-    # ── Functions ────────────────────────────────────────────────
+    # ── Per-row data helpers ──────────────────────────────────────
 
-    def _toggle_all():
-        val = select_all_var.get()
-        for r in rows:
-            r['apply_var'].set(val)
-        _update_status()
+    def _get_ep_id_for_row(r):
+        """Return (ep_tag, score, detail, title_suffix) using current ordering."""
+        ord_name = global_ordering.get()
+        orderings = r.get('ep_id_orderings', {})
+        if not orderings:
+            return '', 0, '', None
+        if ord_name and ord_name in orderings:
+            best = orderings[ord_name]
+        else:
+            best = max(orderings.values(), key=lambda x: x['match_score'])
+        ep_tag = best.get('tag', '')
+        score = best.get('match_score', 0)
+        tag_eps = best.get('tag_episodes') or best.get('episodes', [])[:1]
+        titles = [t for _, _, t, _ in tag_eps if t]
+        detail = ' / '.join(titles)
+        suffix = (' - ' + ' - '.join(titles)) if titles else None
+        return ep_tag, score, detail, suffix
+
+    def _get_ep_title_for_row(r):
+        """Return (display_text, apply_text, sxxexx_tag, ord_name) using current ordering."""
+        ord_name = global_ordering.get()
+        orderings = r.get('ep_title_orderings', {})
+        if not orderings:
+            return '', None, None, ''
+        if ord_name and ord_name in orderings:
+            chosen_name = ord_name
+            eps = orderings[ord_name]
+        else:
+            chosen_name, eps = next(
+                ((k, v) for k, v in orderings.items() if any(t for _, _, t in v)),
+                (None, None))
+            if not chosen_name:
+                return '', None, None, ''
+        titles = [t for _, _, t in eps if t]
+        if not titles:
+            return '', None, None, chosen_name
+        combined = ' - '.join(titles)
+        # Build SxxExx tag from the matched episodes
+        if eps:
+            season = eps[0][0]
+            sxxexx = f'S{season:02d}' + ''.join(f'E{e[1]:02d}' for e in eps)
+        else:
+            sxxexx = None
+        return combined, f' - {combined}', sxxexx, chosen_name
+
+    # ── UI update helpers ─────────────────────────────────────────
 
     def _update_status():
-        selected = sum(1 for r in rows if r['apply_var'].get())
+        n_sel = sum(1 for v in row_selected.values() if v)
         parts = []
         if global_year.get():
             parts.append("Year")
@@ -692,150 +750,135 @@ def build_tvdb_popup(parent, filepaths, apply_callback):
         elif mode == 'ep_title':
             parts.append("Episode Title")
         what = ', '.join(parts) if parts else 'Nothing'
-        status_var.set(f"{selected}/{len(rows)} selected  ·  Applying: {what}")
+        status_var.set(f"{n_sel}/{len(row_data_list)} selected  ·  Applying: {what}")
+
+    def _redraw_row(iid):
+        r = next((rd for rd in row_data_list if rd.get('iid') == iid), None)
+        if r is None:
+            return
+        sel = row_selected.get(iid, True)
+        sel_text = '☑' if sel else '☐'
+        year_text = f"({r['year']})" if r.get('year') else ''
+
+        mode = global_mode.get()
+        if mode == 'ep_id':
+            ep_tag, score, detail, _ = _get_ep_id_for_row(r)
+            result_text = ep_tag or '—'
+            score_text = f"{score:.0%}" if ep_tag else ''
+            detail_text = detail
+            if ep_tag:
+                row_tag = ('score_green' if score >= 0.8
+                           else 'score_yellow' if score >= 0.6
+                           else 'score_red')
+            else:
+                row_tag = 'dim'
+        else:
+            display, _, _, ord_name = _get_ep_title_for_row(r)
+            result_text = display or '—'
+            score_text = ''
+            detail_text = f'[{ord_name}]' if ord_name else ''
+            row_tag = 'ep_title' if display else 'dim'
+
+        if not sel:
+            row_tag = 'unsel'
+
+        tree.item(iid,
+            values=(sel_text, r['basename'], year_text,
+                    result_text, score_text, detail_text),
+            tags=(row_tag,))
 
     def _refresh_results():
-        """Update the result/score/detail columns based on the current mode."""
-        mode = global_mode.get()
-        for r in rows:
-            if mode == 'ep_id':
-                tag = r.get('ep_id_tag') or ''
-                score = r.get('ep_id_score', 0)
-                r['result_label'].configure(
-                    text=tag or '—',
-                    fg=_score_color(score) if tag else _FG_DIM)
-                r['score_label'].configure(
-                    text=f"{score:.0%}" if tag else '',
-                    fg=_score_color(score) if tag else _FG_DIM)
-                detail = r.get('ep_id_detail', '')
-                if r.get('ep_id_ordering'):
-                    detail = f"[{r['ep_id_ordering']}] {detail}"
-                r['detail_label'].configure(text=detail)
-            else:
-                text = r.get('ep_title_display') or ''
-                r['result_label'].configure(
-                    text=text or '—',
-                    fg=_GREEN if text else _FG_DIM)
-                r['score_label'].configure(text='', fg=_FG_DIM)
-                ordering = r.get('ep_title_ordering', '')
-                r['detail_label'].configure(
-                    text=f"[{ordering}]" if ordering else '')
+        for iid in tree.get_children():
+            _redraw_row(iid)
         _update_status()
+
+    def _toggle_row(iid):
+        row_selected[iid] = not row_selected.get(iid, True)
+        _redraw_row(iid)
+        _update_status()
+
+    def _toggle_all():
+        # If all selected → deselect all, else select all
+        want = not all(row_selected.get(iid, True) for iid in row_selected)
+        for iid in row_selected:
+            row_selected[iid] = want
+        for iid in tree.get_children():
+            _redraw_row(iid)
+        _update_status()
+
+    def _populate_ordering_combo():
+        """Collect all ordering names from all rows, populate the combobox."""
+        names = set()
+        for r in row_data_list:
+            names.update(r.get('ep_id_orderings', {}).keys())
+            names.update(r.get('ep_title_orderings', {}).keys())
+        choices = ['Best (Auto)'] + sorted(names)
+        ordering_combo['values'] = choices
+        if ordering_combo.get() not in choices:
+            ordering_combo.set('Best (Auto)')
+
+    def _on_ordering_selected(event=None):
+        val = ordering_combo.get()
+        global_ordering.set('' if val == 'Best (Auto)' else val)
+        _refresh_results()
+
+    # ── Lookup + data processing ──────────────────────────────────
 
     def _process_file(fp):
         """Run all lookups for one file. Returns a data dict."""
         data = {
             'filepath': fp,
             'basename': os.path.basename(fp),
-            'year': None, 'year_confidence': 0, 'year_series': '',
-            'ep_id_tag': None, 'ep_id_score': 0,
-            'ep_id_detail': '', 'ep_id_ordering': '', 'ep_id_title_suffix': None,
-            'ep_title_text': None, 'ep_title_display': '',
-            'ep_title_ordering': '',
+            'year': None, 'year_confidence': 0,
+            'ep_id_orderings': {},
+            'ep_title_orderings': {},
         }
         try:
-            year, conf, sname = lookup_year(fp)
+            year, conf, _ = lookup_year(fp)
             if year:
                 data['year'] = str(year)
                 data['year_confidence'] = conf
-                data['year_series'] = sname or ''
         except Exception:
             pass
-
         try:
             ep_result = lookup_episode_id(fp)
             if ep_result and ep_result.get('orderings'):
-                best_name, best_data = max(
-                    ep_result['orderings'].items(),
-                    key=lambda x: x[1]['match_score'])
-                data['ep_id_tag'] = best_data['tag']
-                data['ep_id_score'] = best_data['match_score']
-                data['ep_id_ordering'] = best_name
-                tag_eps = best_data.get('tag_episodes') or best_data.get('episodes', [])[:1]
-                titles = [t for _, _, t, _ in tag_eps if t]
-                data['ep_id_detail'] = ' / '.join(titles)
-                if titles:
-                    data['ep_id_title_suffix'] = ' - ' + ' - '.join(titles)
+                data['ep_id_orderings'] = ep_result['orderings']
         except Exception:
             pass
-
         try:
             title_result = lookup_episode_title(fp)
             if title_result and title_result.get('orderings'):
-                for oname, eps in title_result['orderings'].items():
-                    titles = [t for _, _, t in eps if t]
-                    if titles:
-                        combined = ' - '.join(titles)
-                        data['ep_title_text'] = f" - {combined}"
-                        data['ep_title_display'] = combined
-                        data['ep_title_ordering'] = oname
-                        break
+                data['ep_title_orderings'] = title_result['orderings']
         except Exception:
             pass
-
         return data
 
     def _add_row(data):
-        """Add one compact row to the table."""
-        idx = len(rows)
-        bg = _BG2 if idx % 2 == 0 else _BG3
-
-        row_frame = tk.Frame(table_frame, bg=bg)
-        row_frame.pack(fill=tk.X, pady=0)
-
-        apply_var = tk.BooleanVar(value=True)
-
-        tk.Checkbutton(row_frame, variable=apply_var, bg=bg, fg=_FG,
-                       selectcolor=_ENT, activebackground=bg,
-                       activeforeground=_FG,
-                       command=_update_status).pack(side=tk.LEFT, padx=(4, 0))
-
-        basename = data['basename']
-        display_name = basename if len(basename) <= 55 else basename[:52] + '...'
-        tk.Label(row_frame, text=display_name, font=("Consolas", 9),
-                 bg=bg, fg=_FG, width=55, anchor='w').pack(side=tk.LEFT, padx=(2, 0))
-
-        year_text = f"({data['year']})" if data['year'] else ''
-        year_fg = _score_color(data['year_confidence']) if data['year'] else _FG_DIM
-        tk.Label(row_frame, text=year_text, font=("Consolas", 9),
-                 bg=bg, fg=year_fg, width=8, anchor='center').pack(side=tk.LEFT)
-
-        result_lbl = tk.Label(row_frame, text='', font=("Consolas", 9, "bold"),
-                              bg=bg, fg=_FG, width=18, anchor='w')
-        result_lbl.pack(side=tk.LEFT, padx=(4, 0))
-
-        score_lbl = tk.Label(row_frame, text='', font=("Consolas", 9),
-                             bg=bg, fg=_FG, width=6, anchor='center')
-        score_lbl.pack(side=tk.LEFT)
-
-        detail_lbl = tk.Label(row_frame, text='', font=("Consolas", 8),
-                              bg=bg, fg=_FG_DIM, anchor='w')
-        detail_lbl.pack(side=tk.LEFT, padx=(4, 0), fill=tk.X, expand=True)
-
-        row_data = dict(data)
-        row_data.update({
-            'apply_var': apply_var,
-            'result_label': result_lbl,
-            'score_label': score_lbl,
-            'detail_label': detail_lbl,
-        })
-        rows.append(row_data)
+        iid = tree.insert('', tk.END,
+            values=('☑', data['basename'], '', '', '', ''),
+            tags=('dim',))
+        data['iid'] = iid
+        row_data_list.append(data)
+        row_selected[iid] = True
 
     def _lookup_all():
-        for w in table_frame.winfo_children():
-            w.destroy()
-        rows.clear()
+        tree.delete(*tree.get_children())
+        row_data_list.clear()
+        row_selected.clear()
+        ordering_combo.set('Best (Auto)')
+        global_ordering.set('')
         _lookup_file_at(0)
 
     def _lookup_file_at(idx):
         if idx >= len(filepaths):
+            _populate_ordering_combo()
             _refresh_results()
+            n_id = sum(1 for r in row_data_list if r.get('ep_id_orderings'))
+            n_ti = sum(1 for r in row_data_list if r.get('ep_title_orderings'))
             status_var.set(
-                f"Done — {len(rows)} files  ·  "
-                f"{sum(1 for r in rows if r.get('ep_id_tag'))}"
-                f" with Episode ID  ·  "
-                f"{sum(1 for r in rows if r.get('ep_title_text'))}"
-                f" with Title")
+                f"Done — {len(row_data_list)} files  ·  "
+                f"{n_id} with Episode ID  ·  {n_ti} with Title")
             _update_status()
             return
         fp = filepaths[idx]
@@ -845,47 +888,31 @@ def build_tvdb_popup(parent, filepaths, apply_callback):
         popup.update_idletasks()
         data = _process_file(fp)
         _add_row(data)
-        # Update just the new row
-        mode = global_mode.get()
-        r = rows[-1]
-        if mode == 'ep_id':
-            tag = r.get('ep_id_tag') or ''
-            score = r.get('ep_id_score', 0)
-            r['result_label'].configure(
-                text=tag or '—',
-                fg=_score_color(score) if tag else _FG_DIM)
-            r['score_label'].configure(
-                text=f"{score:.0%}" if tag else '',
-                fg=_score_color(score) if tag else _FG_DIM)
-            detail = r.get('ep_id_detail', '')
-            if r.get('ep_id_ordering'):
-                detail = f"[{r['ep_id_ordering']}] {detail}"
-            r['detail_label'].configure(text=detail)
-        else:
-            text = r.get('ep_title_display') or ''
-            r['result_label'].configure(
-                text=text or '—', fg=_GREEN if text else _FG_DIM)
-            r['score_label'].configure(text='', fg=_FG_DIM)
-            ordering = r.get('ep_title_ordering', '')
-            r['detail_label'].configure(
-                text=f"[{ordering}]" if ordering else '')
+        _redraw_row(data['iid'])
         popup.update_idletasks()
         popup.after(1, lambda: _lookup_file_at(idx + 1))
 
     def _apply():
         mode = global_mode.get()
-        for r in rows:
-            if not r['apply_var'].get():
+        for r in row_data_list:
+            iid = r.get('iid')
+            if not row_selected.get(iid, True):
                 continue
             changes = {'year': None, 'sxxexx': None, 'episode_title': None}
             if global_year.get() and r.get('year'):
                 changes['year'] = r['year']
-            if mode == 'ep_id' and r.get('ep_id_tag'):
-                changes['sxxexx'] = r['ep_id_tag']
-                if r.get('ep_id_title_suffix'):
-                    changes['episode_title'] = r['ep_id_title_suffix']
-            elif mode == 'ep_title' and r.get('ep_title_text'):
-                changes['episode_title'] = r['ep_title_text']
+            if mode == 'ep_id':
+                ep_tag, _, _, suffix = _get_ep_id_for_row(r)
+                if ep_tag:
+                    changes['sxxexx'] = ep_tag
+                    if suffix:
+                        changes['episode_title'] = suffix
+            elif mode == 'ep_title':
+                _, text, sxxexx_tag, _ = _get_ep_title_for_row(r)
+                if text:
+                    changes['episode_title'] = text
+                if sxxexx_tag:
+                    changes['sxxexx'] = sxxexx_tag
             if any(v is not None for v in changes.values()):
                 apply_callback(r['filepath'], changes)
         popup.destroy()
@@ -899,9 +926,8 @@ def build_tvdb_popup(parent, filepaths, apply_callback):
 
     tk.Checkbutton(ctrl_frame, text="Year", variable=global_year,
                    font=("Consolas", 10), bg=_BG, fg=_FG,
-                   selectcolor=_ENT, activebackground=_BG,
-                   activeforeground=_FG,
-                   command=_update_status).pack(side=tk.LEFT, padx=(0, 20))
+                   selectcolor=_ENT, activebackground=_BG, activeforeground=_FG,
+                   command=_update_status).pack(side=tk.LEFT, padx=(0, 12))
 
     ttk.Separator(ctrl_frame, orient=tk.VERTICAL).pack(
         side=tk.LEFT, fill=tk.Y, padx=(0, 12), pady=2)
@@ -909,69 +935,79 @@ def build_tvdb_popup(parent, filepaths, apply_callback):
     tk.Radiobutton(ctrl_frame, text="Episode ID (S00E00)",
                    variable=global_mode, value='ep_id',
                    font=("Consolas", 10), bg=_BG, fg=_FG,
-                   selectcolor=_ENT, activebackground=_BG,
-                   activeforeground=_FG,
+                   selectcolor=_ENT, activebackground=_BG, activeforeground=_FG,
                    command=_refresh_results).pack(side=tk.LEFT, padx=(0, 10))
 
     tk.Radiobutton(ctrl_frame, text="Episode Title",
                    variable=global_mode, value='ep_title',
                    font=("Consolas", 10), bg=_BG, fg=_FG,
-                   selectcolor=_ENT, activebackground=_BG,
-                   activeforeground=_FG,
-                   command=_refresh_results).pack(side=tk.LEFT, padx=(0, 10))
+                   selectcolor=_ENT, activebackground=_BG, activeforeground=_FG,
+                   command=_refresh_results).pack(side=tk.LEFT, padx=(0, 16))
+
+    ttk.Separator(ctrl_frame, orient=tk.VERTICAL).pack(
+        side=tk.LEFT, fill=tk.Y, padx=(0, 12), pady=2)
+
+    tk.Label(ctrl_frame, text="Ordering:", font=("Consolas", 10),
+             bg=_BG, fg=_FG).pack(side=tk.LEFT, padx=(0, 4))
+    ordering_combo = ttk.Combobox(ctrl_frame, values=['Best (Auto)'],
+                                   width=22, state='readonly',
+                                   font=("Consolas", 10))
+    ordering_combo.set('Best (Auto)')
+    ordering_combo.pack(side=tk.LEFT)
+    ordering_combo.bind('<<ComboboxSelected>>', _on_ordering_selected)
 
     ttk.Separator(popup, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=8, pady=4)
 
-    # ── Layout: Header Row ───────────────────────────────────────
-    hdr_frame = tk.Frame(popup, bg=_BG2)
-    hdr_frame.pack(fill=tk.X, padx=8)
-
-    tk.Checkbutton(hdr_frame, variable=select_all_var, bg=_BG2, fg=_FG,
-                   selectcolor=_ENT, activebackground=_BG2,
-                   activeforeground=_FG,
-                   command=_toggle_all).pack(side=tk.LEFT, padx=(4, 0))
-    tk.Label(hdr_frame, text="File", font=("Consolas", 9, "bold"),
-             bg=_BG2, fg=_FG, width=55, anchor='w').pack(
-        side=tk.LEFT, padx=(2, 0))
-    tk.Label(hdr_frame, text="Year", font=("Consolas", 9, "bold"),
-             bg=_BG2, fg=_FG, width=8, anchor='center').pack(side=tk.LEFT)
-    tk.Label(hdr_frame, text="Result", font=("Consolas", 9, "bold"),
-             bg=_BG2, fg=_FG, width=18, anchor='w').pack(
-        side=tk.LEFT, padx=(4, 0))
-    tk.Label(hdr_frame, text="Score", font=("Consolas", 9, "bold"),
-             bg=_BG2, fg=_FG, width=6, anchor='center').pack(side=tk.LEFT)
-    tk.Label(hdr_frame, text="Detail", font=("Consolas", 9, "bold"),
-             bg=_BG2, fg=_FG, anchor='w').pack(
-        side=tk.LEFT, padx=(4, 0), fill=tk.X, expand=True)
-
-    # ── Layout: Scrollable Table ─────────────────────────────────
+    # ── Layout: Treeview Table ────────────────────────────────────
     table_container = tk.Frame(popup, bg=_BG)
     table_container.pack(fill=tk.BOTH, expand=True, padx=8)
 
-    table_scrollbar = ttk.Scrollbar(table_container, orient=tk.VERTICAL)
-    table_canvas = tk.Canvas(table_container, bg=_BG,
-                             highlightthickness=0,
-                             yscrollcommand=table_scrollbar.set)
-    table_scrollbar.configure(command=table_canvas.yview)
+    tree_scroll = ttk.Scrollbar(table_container, orient=tk.VERTICAL)
+    tree = ttk.Treeview(
+        table_container,
+        style='TVDB.Treeview',
+        columns=('sel', 'file', 'year', 'result', 'score', 'detail'),
+        show='headings',
+        yscrollcommand=tree_scroll.set,
+        selectmode='none',
+    )
+    tree_scroll.configure(command=tree.yview)
+    tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+    tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-    table_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-    table_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    # Column headings & widths
+    tree.heading('sel',    text='✓', anchor='center', command=_toggle_all)
+    tree.heading('file',   text='File',   anchor='w')
+    tree.heading('year',   text='Year',   anchor='center')
+    tree.heading('result', text='Result', anchor='w')
+    tree.heading('score',  text='Score',  anchor='center')
+    tree.heading('detail', text='Detail', anchor='w')
 
-    table_frame = tk.Frame(table_canvas, bg=_BG)
-    canvas_window = table_canvas.create_window(
-        (0, 0), window=table_frame, anchor='nw')
+    tree.column('sel',    width=30,  minwidth=30,  stretch=False, anchor='center')
+    tree.column('file',   width=420, minwidth=120, stretch=True,  anchor='w')
+    tree.column('year',   width=70,  minwidth=50,  stretch=False, anchor='center')
+    tree.column('result', width=130, minwidth=80,  stretch=False, anchor='w')
+    tree.column('score',  width=55,  minwidth=45,  stretch=False, anchor='center')
+    tree.column('detail', width=340, minwidth=100, stretch=True,  anchor='w')
 
-    def _on_frame_configure(event):
-        table_canvas.configure(scrollregion=table_canvas.bbox('all'))
-    table_frame.bind('<Configure>', _on_frame_configure)
+    # Row colour tags
+    tree.tag_configure('score_green',  foreground=_GREEN)
+    tree.tag_configure('score_yellow', foreground=_YELLOW)
+    tree.tag_configure('score_red',    foreground=_RED)
+    tree.tag_configure('ep_title',     foreground=_GREEN)
+    tree.tag_configure('dim',          foreground=_FG_DIM)
+    tree.tag_configure('unsel',        foreground=_FG_DIM)
 
-    def _on_canvas_configure(event):
-        table_canvas.itemconfig(canvas_window, width=event.width)
-    table_canvas.bind('<Configure>', _on_canvas_configure)
+    def _on_tree_click(event):
+        if tree.identify_region(event.x, event.y) == 'cell':
+            if tree.identify_column(event.x) == '#1':
+                iid = tree.identify_row(event.y)
+                if iid:
+                    _toggle_row(iid)
 
-    def _on_mousewheel(event):
-        table_canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
-    table_canvas.bind_all('<MouseWheel>', _on_mousewheel)
+    tree.bind('<ButtonRelease-1>', _on_tree_click)
+    tree.bind('<MouseWheel>',
+              lambda e: tree.yview_scroll(int(-1 * (e.delta / 120)), 'units'))
 
     # ── Layout: Bottom Bar ───────────────────────────────────────
     bottom_frame = tk.Frame(popup, bg=_BG)

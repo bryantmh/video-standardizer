@@ -187,7 +187,8 @@ def build_output_filename(input_file, extension, streams, format_info,
     basename = os.path.basename(input_file)
 
     pattern = r'\[\w+ \d+Mbps \w+\]\.\w+$'
-    if not convert_force and re.search(pattern, basename):
+    has_tvdb_changes = any(v is not None for v in (tvdb_changes or {}).values())
+    if not convert_force and not has_tvdb_changes and re.search(pattern, basename):
         return None
 
     if norename:
@@ -329,7 +330,7 @@ def process_file(file, extension="mkv", dry_run=False, rename=False, verbose=Fal
     input_ext = os.path.splitext(file)[1].lstrip('.').lower()
     same_container = input_ext == actual_extension.lower()
 
-    if not convert_force and (rename or (same_audio and same_subs and no_external_subs and same_container)):
+    if same_container and (rename or (same_audio and same_subs and no_external_subs)):
         original_ext = os.path.splitext(file)[1]
         output_with_orig = os.path.splitext(output_file)[0] + original_ext
         if os.path.normpath(file) == os.path.normpath(output_with_orig):
@@ -467,12 +468,12 @@ def process_file(file, extension="mkv", dry_run=False, rename=False, verbose=Fal
         return {'status': 'failed'}
     else:
         print_fn("  ✓ Complete", 'keep')
-        return {'status': 'remuxed'}
+        return {'status': 'remuxed', 'output_file': output_file}
 
 
 def build_file_plan(file, extension="mkv", norename=False, convert_force=False,
                     output_dir=None, keep_languages=None, keep_suffix=False,
-                    tvdb_changes=None):
+                    tvdb_changes=None, rename=False):
     """Return a human-readable diff of what will be done to a file."""
     if keep_languages is None:
         keep_languages = list(DEFAULT_KEEP_LANGUAGES)
@@ -521,6 +522,16 @@ def build_file_plan(file, extension="mkv", norename=False, convert_force=False,
     out_name = os.path.basename(output_file)
     in_name = os.path.basename(file)
     lines.append(f"Output:   {out_name}" if out_name != in_name else "Output:   (same name)")
+
+    # Determine action: rename-only vs remux
+    # Mirrors process_file logic: rename flag OR (same streams AND same container)
+    needs_language_change = any(a[2] for a in audio_selection)
+    same_audio = len(audio_selection) == len(audio_streams_all) and not needs_language_change
+    same_subs = len(subtitle_selection) == len(subtitle_streams_all)
+    input_ext = os.path.splitext(file)[1].lstrip('.').lower()
+    same_container = input_ext == actual_extension.lower()
+    will_rename = same_container and (rename or (same_audio and same_subs and external_sub is None))
+    lines.append(f"Action:   {'RENAME ONLY (no re-encode)' if will_rename else 'REMUX (re-mux streams)'}")
 
     lines.append(f"File:     {os.path.basename(file)}")
     lines.append(f"Duration: {dur_str}   Total bitrate: {br_str}")
@@ -809,6 +820,9 @@ def launch_gui(terminal_cwd=None):
                             variable=self.keep_suffix_var).pack(anchor=tk.W)
             ttk.Checkbutton(opts_frame, text="Force Re-process",
                             variable=self.force_var).pack(anchor=tk.W)
+            self.delete_original_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(opts_frame, text="Delete Original After Re-process",
+                            variable=self.delete_original_var).pack(anchor=tk.W)
             ttk.Checkbutton(opts_frame, text="Verbose Output",
                             variable=self.verbose_var).pack(anchor=tk.W)
 
@@ -1079,6 +1093,7 @@ def launch_gui(terminal_cwd=None):
                         keep_languages=languages,
                         keep_suffix=self.keep_suffix_var.get(),
                         tvdb_changes=self._tvdb_changes.get(f),
+                        rename=self.rename_var.get(),
                     )
                     self._log_plan(plan)
                 except Exception as e:
@@ -1151,6 +1166,7 @@ def launch_gui(terminal_cwd=None):
             norename = self.norename_var.get()
             force = self.force_var.get()
             keep_suffix = self.keep_suffix_var.get()
+            delete_original = self.delete_original_var.get()
 
             def print_fn(msg, tag=None):
                 self.root.after(0, self._log, msg, tag)
@@ -1177,6 +1193,7 @@ def launch_gui(terminal_cwd=None):
                                 convert_force=force, output_dir=output_dir,
                                 keep_languages=languages, keep_suffix=keep_suffix,
                                 tvdb_changes=self._tvdb_changes.get(f),
+                                rename=rename,
                             )
                             print_plan(plan)
                         except Exception as pe:
@@ -1213,6 +1230,17 @@ def launch_gui(terminal_cwd=None):
 
                         status = (result or {}).get('status', 'skipped')
                         stats[status] = stats.get(status, 0) + 1
+
+                        if (status == 'remuxed' and delete_original
+                                and not dry_run
+                                and (result or {}).get('output_file') != f
+                                and os.path.exists(f)):
+                            try:
+                                os.remove(f)
+                                print_fn(f"  Deleted original: {os.path.basename(f)}", 'warn')
+                            except Exception as del_err:
+                                print_fn(f"  Could not delete original: {del_err}", 'drop')
+
                         icon = ('done'    if status == 'remuxed' else
                                 'renamed' if status == 'renamed' else
                                 'skipped' if status in ('skipped', 'dry_run') else
