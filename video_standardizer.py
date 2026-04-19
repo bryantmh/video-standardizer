@@ -197,9 +197,14 @@ def build_output_filename(input_file, extension, streams, format_info,
 
     tc = tvdb_changes or {}
 
-    # Use TVDB sxxexx if provided, otherwise extract from filename
-    if tc.get('sxxexx'):
-        tag = tc['sxxexx']
+    # Use TVDB sxxexx if provided and it looks like a valid SxxExx tag,
+    # otherwise extract from filename
+    _sxxexx_pattern = re.compile(r'^[Ss]\d{1,2}(?:[Ee]\d{1,3})+$')
+    raw_sxxexx = tc.get('sxxexx') or ''
+    valid_sxxexx = raw_sxxexx if _sxxexx_pattern.match(raw_sxxexx) else ''
+
+    if valid_sxxexx:
+        tag = valid_sxxexx
         suffix = tc.get('episode_title', '') or ''
     else:
         tag, suffix, _ = extract_episode_info(basename, keep_suffix=keep_suffix)
@@ -217,6 +222,10 @@ def build_output_filename(input_file, extension, streams, format_info,
 
     # Strip any existing metadata tag so force-reprocess doesn't double it
     filename = re.sub(r'\s*\[\w+\s+\d+Mbps\s+\w+\]', '', filename).rstrip()
+
+    # Sanitize illegal Windows filename characters (e.g. TVDB titles with '/')
+    filename = re.sub(r'[/\\:*?"<>|]', ' -', filename)
+    filename = re.sub(r'\s{2,}', ' ', filename).strip()
 
     # Insert year before metadata tag if provided by TVDB
     if tc.get('year'):
@@ -536,9 +545,9 @@ def build_file_plan(file, extension="mkv", norename=False, convert_force=False,
     lines.append(f"File:     {os.path.basename(file)}")
     lines.append(f"Duration: {dur_str}   Total bitrate: {br_str}")
 
-    if actual_extension != extension:
-        lines.append(f"Container: {extension.upper()} → {actual_extension.upper()}"
-                     f"  (subtitle compatibility)")
+    # Only show container change if the input container is actually different
+    if not same_container:
+        lines.append(f"Container: {input_ext.upper()} → {actual_extension.upper()}")
     else:
         lines.append(f"Container: {actual_extension.upper()}")
     lines.append("")
@@ -551,37 +560,59 @@ def build_file_plan(file, extension="mkv", norename=False, convert_force=False,
             return f"  {br/1_000_000:.1f}Mbps"
         return f"  {br//1000}kbps"
 
-    for s in video_streams_all:
-        codec = s.get('codec_name', '?').upper()
-        w, h = s.get('width', '?'), s.get('height', '?')
-        br_note = _stream_br(s)
-        lines.append(f"  ✓ Video    [{codec:>6}]  {w}x{h}{br_note}  →  copy")
+    if will_rename:
+        # Informational only — no remux actions
+        for s in video_streams_all:
+            codec = s.get('codec_name', '?').upper()
+            w, h = s.get('width', '?'), s.get('height', '?')
+            br_note = _stream_br(s)
+            lines.append(f"     Video    [{codec:>6}]  {w}x{h}{br_note}")
 
-    audio_kept = {a[0]: a for a in audio_selection}
-    for i, s in enumerate(audio_streams_all):
-        lang = s.get('tags', {}).get('language', 'und')
-        codec = s.get('codec_name', '?').upper()
-        ch = s.get('channels', '?')
-        br_note = _stream_br(s)
-        if i in audio_kept:
-            _, new_lang, changed = audio_kept[i]
-            tag_note = f"  [tag: {lang}→{new_lang}]" if changed else ""
-            lines.append(f"  ✓ Audio    [{codec:>6}]  {ch}ch{br_note}  lang={lang}{tag_note}  →  copy")
-        else:
-            lines.append(f"  ✗ Audio    [{codec:>6}]  {ch}ch{br_note}  lang={lang}  →  DROP")
+        for s in audio_streams_all:
+            lang = s.get('tags', {}).get('language', 'und')
+            codec = s.get('codec_name', '?').upper()
+            ch = s.get('channels', '?')
+            br_note = _stream_br(s)
+            lines.append(f"     Audio    [{codec:>6}]  {ch}ch{br_note}  lang={lang}")
 
-    for i, s in enumerate(subtitle_streams_all):
-        lang = s.get('tags', {}).get('language', 'und')
-        codec = s.get('codec_name', '?')
-        title = s.get('tags', {}).get('title', '')
-        label = f"lang={lang}" + (f"  {title}" if title else "")
-        if i in subtitle_selection:
-            lines.append(f"  ✓ Sub      [{codec:>20}]  {label}  →  copy")
-        else:
-            lines.append(f"  ✗ Sub      [{codec:>20}]  {label}  →  DROP")
+        for s in subtitle_streams_all:
+            lang = s.get('tags', {}).get('language', 'und')
+            codec = s.get('codec_name', '?')
+            title = s.get('tags', {}).get('title', '')
+            label = f"lang={lang}" + (f"  {title}" if title else "")
+            lines.append(f"     Sub      [{codec:>20}]  {label}")
+    else:
+        for s in video_streams_all:
+            codec = s.get('codec_name', '?').upper()
+            w, h = s.get('width', '?'), s.get('height', '?')
+            br_note = _stream_br(s)
+            lines.append(f"  ✓ Video    [{codec:>6}]  {w}x{h}{br_note}  →  copy")
 
-    if external_sub:
-        lines.append(f"  ✓ Sub      [{'external':>20}]  {os.path.basename(external_sub)}  →  embed")
+        audio_kept = {a[0]: a for a in audio_selection}
+        for i, s in enumerate(audio_streams_all):
+            lang = s.get('tags', {}).get('language', 'und')
+            codec = s.get('codec_name', '?').upper()
+            ch = s.get('channels', '?')
+            br_note = _stream_br(s)
+            if i in audio_kept:
+                _, new_lang, changed = audio_kept[i]
+                tag_note = f"  [tag: {lang}→{new_lang}]" if changed else ""
+                lines.append(f"  ✓ Audio    [{codec:>6}]  {ch}ch{br_note}  lang={lang}{tag_note}  →  copy")
+            else:
+                lines.append(f"  ✗ Audio    [{codec:>6}]  {ch}ch{br_note}  lang={lang}  →  DROP")
+
+        for i, s in enumerate(subtitle_streams_all):
+            lang = s.get('tags', {}).get('language', 'und')
+            codec = s.get('codec_name', '?')
+            title = s.get('tags', {}).get('title', '')
+            label = f"lang={lang}" + (f"  {title}" if title else "")
+            if i in subtitle_selection:
+                lines.append(f"  ✓ Sub      [{codec:>20}]  {label}  →  copy")
+            else:
+                lines.append(f"  ✗ Sub      [{codec:>20}]  {label}  →  DROP")
+
+        if external_sub:
+            lines.append(f"  ✓ Sub      [{'external':>20}]  {os.path.basename(external_sub)}  →  embed")
 
     lines.append(SEP)
     return "\n".join(lines)
