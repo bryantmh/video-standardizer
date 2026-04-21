@@ -8,3 +8,4 @@ video_standardizer_config.json
 video-standardizer.code-workspace
 config.env
 tvdb_cache.json
+comskip_dst/*

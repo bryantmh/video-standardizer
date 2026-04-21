@@ -4,6 +4,8 @@ A Python utility for cleaning up and standardizing a video library. It handles t
 
 It works well for processing downloaded TV episodes and movies that arrive in inconsistent states: mixed containers, wrong or missing language tags, multiple audio tracks in unwanted languages, embedded EIA-608 garbage captions, or arbitrary filenames.
 
+The repository also ships companion tools for **commercial removal** ([batch_comskip.py](batch_comskip.py) + [batch_vrd_save.py](batch_vrd_save.py)) and several **library maintenance utilities** under [scripts/](scripts/) (find-by-extension, corruption scan, resolution report, empty-folder cleanup).
+
 ## Features
 
 - **Zero re-encoding** — every operation is a stream copy; processing is fast regardless of file size
@@ -16,17 +18,23 @@ It works well for processing downloaded TV episodes and movies that arrive in in
 - **Error logging** — failed conversions are written to `conversion_errors.log` with the full ffmpeg error for later review
 - **GUI and CLI modes** — full Tkinter GUI with live output, or fully scriptable from the command line
 - **TVDB integration** — look up and apply series year, correct episode IDs (`S01E01`), and proper episode titles directly from [TheTVDB](https://thetvdb.com), with support for multiple season orderings (Aired, DVD, Absolute, etc.)
+- **Commercial detection & removal** — batch-run [Comskip](https://www.kaashoek.com/comskip/) across a folder (or piped file list) and smart-render the detected ad regions out via [VideoReDo](https://www.videoredo.com/)'s silent COM interface; live Rich dashboard shows per-file phase, percent, and elapsed time
 
 ## Requirements
 
 - Python 3.8+
-- [FFmpeg](https://ffmpeg.org/download.html) (both `ffmpeg` and `ffprobe` must be on your `PATH`)
+- [FFmpeg](https://ffmpeg.org/download.html) (both `ffmpeg` and `ffprobe` must be on your `PATH`) — required for the standardizer
+- [Comskip](https://www.comskip.org/) — required for `batch_comskip.py`. A `comskip.exe` and `comskip.ini` are expected in [comskip_dst/](comskip_dst/) by default (override with `--comskip` / `--comskip-ini`).
+- [VideoReDo TVSuite v6](https://www.videoredo.com/) — required for `batch_comskip.py` and `batch_vrd_save.py`. The scripts talk to its `VideoReDo6.VideoReDoSilent` COM object (Windows only).
 
 ### Python dependencies
 
 | Package | Purpose | Required? |
 |---------|---------|----------|
-| [`tkinterdnd2`](https://pypi.org/project/tkinterdnd2/) | Drag-and-drop files/folders onto the GUI input field | **Required** |
+| [`tkinterdnd2`](https://pypi.org/project/tkinterdnd2/) | Drag-and-drop files/folders onto the standardizer GUI input field | Standardizer GUI |
+| [`rich`](https://pypi.org/project/rich/) | Live batch dashboard used by `batch_comskip.py` | Comskip batch |
+| [`pywin32`](https://pypi.org/project/pywin32/) | Drives the VideoReDo silent COM interface | Comskip batch |
+| [`send2trash`](https://pypi.org/project/Send2Trash/) | Move originals to the recycle bin when using `--recycle` | Comskip batch (optional) |
 
 A free [TheTVDB](https://thetvdb.com) account and API key are required to use TVDB features. See [TVDB Setup](#tvdb-setup) below.
 
@@ -193,6 +201,66 @@ Use [ISO 639-2/B](https://en.wikipedia.org/wiki/List_of_ISO_639-2_codes) three-l
 | German | `deu` |
 | Chinese | `zho` |
 | Korean | `kor` |
+
+## Commercial Removal (Comskip + VideoReDo)
+
+`batch_comskip.py` walks a folder (or reads a file list from stdin), runs Comskip on each video to detect ad regions, then hands the resulting `.VPrj` to a silent VideoReDo instance which **smart-renders** (no re-encode) the source minus the cut regions. Output is written next to the source as `<stem>_no_ads.mkv`.
+
+`batch_vrd_save.py` isn't a standalone entry point — it's the shared library that exposes the VideoReDo save pipeline, the Rich live dashboard, and video discovery helpers. `batch_comskip.py` is the driver.
+
+### Usage
+
+Process every video in a folder:
+
+```
+python batch_comskip.py "C:\Recorded TV"
+```
+
+Process a piped list of paths (one per line) — pairs well with `scripts/find_by_ext.py`:
+
+```
+python scripts/find_by_ext.py "C:\Recorded TV" --ext .ts | python batch_comskip.py -
+```
+
+Replace originals with the cleaned output (originals go to the recycle bin, output is renamed into place as `.mkv`):
+
+```
+python batch_comskip.py "C:\Recorded TV" --recycle
+```
+
+### Options
+
+| Flag | Description |
+|------|-------------|
+| `directory` / `-` | Root folder to scan, or `-` to read newline-separated paths from stdin |
+| `--threads N` | Parallel worker count (default: 8). Each worker runs Comskip and a VideoReDo instance in sequence. |
+| `--recycle` | Send the original to the recycle bin and rename the `_no_ads` output to take its place |
+| `--comskip PATH` | Path to `comskip.exe` (default: `comskip_dst/comskip.exe`) |
+| `--comskip-ini PATH` | Path to `comskip.ini` (default: `comskip_dst/comskip.ini`) |
+
+### Behaviour notes
+
+- Files that already end in `_no_ads` are skipped (they're assumed to be prior outputs of this tool).
+- A file where Comskip detects zero cuts is reported as "No ads" and left alone — not counted as an error.
+- Comskip sidecar files (`.VPrj`, `.edl`, `.log`, `.logo.txt`, `.txt`) are cleaned up after each file regardless of success.
+- Ctrl+C signals a graceful stop: active workers finish their current file, no new files are started.
+
+## Library Maintenance Scripts
+
+Small utilities under [scripts/](scripts/) for housekeeping a video library:
+
+| Script | Purpose |
+|--------|---------|
+| [`find_by_ext.py`](scripts/find_by_ext.py) | Recursively list every file with a given extension. Paths are printed to stdout (status messages go to stderr) so the output can be piped into other tools like `batch_comskip.py`. |
+| [`check_corrupt.py`](scripts/check_corrupt.py) | Scan a library with `ffmpeg` to flag files that fail to decode cleanly. |
+| [`check_resolution.py`](scripts/check_resolution.py) | Report the resolution of every video under a folder. |
+| [`remove_empty_dirs.py`](scripts/remove_empty_dirs.py) | Recursively remove empty subdirectories from a folder tree. |
+
+Example — run commercial removal on every `.ts` file in a folder tree:
+
+```
+python scripts/find_by_ext.py "D:\DVR" --ext .ts | python batch_comskip.py -
+```
 
 ## License
 
