@@ -7,9 +7,14 @@ hands the resulting cut list off to VideoReDo's silent COM instance which
 smart-renders the file with the ad regions removed.
 
 Usage:
-    python batch_comskip.py <directory>
+    python batch_comskip.py <directory|->
                             [--threads N] [--recycle]
                             [--comskip PATH] [--comskip-ini PATH]
+
+    Pass "-" as the directory to read a newline-separated list of file paths
+    from stdin instead of walking a directory, e.g.:
+
+        python scripts/find_by_ext.py "D:\\DVR" --ext .ts | python batch_comskip.py -
 """
 
 import argparse
@@ -26,6 +31,7 @@ from batch_vrd_save import (
     console, _log, _build_table, _set_slot, _upd_slot, _del_slot,
     _fmt_bytes, _fmt_elapsed,
     find_videos, save_vrd,
+    VIDEO_EXTS, NO_ADS_SUFFIX,
 )
 from rich.live import Live
 
@@ -219,6 +225,38 @@ def _worker(task: tuple) -> tuple:
             pass
 
 
+def _read_paths_from_stdin() -> list[str]:
+    """
+    Read newline-separated video paths from stdin. Blank lines are ignored.
+    Non-existent paths and non-video extensions are skipped with a warning;
+    paths already ending in NO_ADS_SUFFIX are silently skipped to match the
+    folder-walk behaviour.
+    """
+    paths: list[str] = []
+    for raw in sys.stdin:
+        p = raw.strip().strip('"').strip("'")
+        if not p:
+            continue
+        stem, ext = os.path.splitext(os.path.basename(p))
+        if stem.endswith(NO_ADS_SUFFIX):
+            continue
+        if ext.lower() not in VIDEO_EXTS:
+            console.print(f'[yellow]  skip (not a video): {p}[/yellow]')
+            continue
+        if not os.path.isfile(p):
+            console.print(f'[yellow]  skip (not found): {p}[/yellow]')
+            continue
+        paths.append(os.path.abspath(p))
+    # De-dup while preserving order.
+    seen = set()
+    unique = []
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+    return unique
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Batch Comskip + VideoReDo save.',
@@ -226,7 +264,8 @@ def main():
         epilog=__doc__,
     )
     parser.add_argument('directory', nargs='?', default=None,
-                        help='Root folder of videos to process')
+                        help='Root folder of videos to process, or "-" to '
+                             'read newline-separated file paths from stdin')
     parser.add_argument('--threads', type=int, default=8,
                         help='Parallel worker count (default: 8).  Each worker '
                              'runs Comskip and a VideoReDo instance in sequence.')
@@ -264,19 +303,33 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    if not os.path.isdir(args.directory):
-        console.print(f'ERROR: not a directory: {args.directory!r}', style='red')
-        sys.exit(1)
+    if args.directory == '-':
+        if sys.stdin.isatty():
+            console.print(
+                'ERROR: "-" was passed but stdin is a terminal. '
+                'Pipe a list of paths in, e.g.:\n'
+                '  python scripts/find_by_ext.py DIR --ext .ts | '
+                'python batch_comskip.py -',
+                style='red',
+            )
+            sys.exit(1)
+        videos = _read_paths_from_stdin()
+        source_desc = '<stdin>'
+    else:
+        if not os.path.isdir(args.directory):
+            console.print(f'ERROR: not a directory: {args.directory!r}', style='red')
+            sys.exit(1)
+        videos = find_videos(args.directory)
+        source_desc = args.directory
 
-    videos = find_videos(args.directory)
-    total  = len(videos)
+    total = len(videos)
     if total == 0:
         console.print('No video files found.')
         return
 
     n_workers = min(args.threads, total)
     console.rule('[bold]Comskip + VideoReDo Batch[/bold]')
-    console.print(f'  Found    [cyan]{total}[/cyan] video file(s) in [dim]{args.directory!r}[/dim]')
+    console.print(f'  Found    [cyan]{total}[/cyan] video file(s) in [dim]{source_desc!r}[/dim]')
     console.print(f'  Comskip  [cyan]{args.comskip}[/cyan]')
     console.print(f'  Workers  [cyan]{n_workers}[/cyan]')
     if args.recycle:

@@ -2,6 +2,12 @@
 """
 find_by_ext.py — recursively find video files with a specific extension.
 
+File paths are written to stdout (one per line); progress/summary messages
+go to stderr, so the output can be piped into other tools without having to
+strip preamble lines. Example:
+
+    python scripts/find_by_ext.py "D:\\DVR" --ext .ts | python batch_comskip.py -
+
 Usage:
     python find_by_ext.py <directory> [--ext .mpg]
 """
@@ -25,7 +31,7 @@ def main():
     ext = args.ext if args.ext.startswith('.') else f'.{args.ext}'
     ext = ext.lower()
 
-    print(f'Scanning {args.directory!r} for *{ext} files...\n')
+    print(f'Scanning {args.directory!r} for *{ext} files...', file=sys.stderr)
 
     found = []
     for dirpath, _dirs, files in os.walk(args.directory):
@@ -34,13 +40,13 @@ def main():
                 found.append(os.path.join(dirpath, f))
 
     if not found:
-        print(f'No {ext} files found.')
+        print(f'No {ext} files found.', file=sys.stderr)
         return
 
     for path in sorted(found):
         print(path)
 
-    print(f'\n{len(found)} file(s) found.')
+    print(f'{len(found)} file(s) found.', file=sys.stderr)
 
 
 if __name__ == '__main__':
