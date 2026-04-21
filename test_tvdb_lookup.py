@@ -812,28 +812,33 @@ class TestEdgeCases(unittest.TestCase):
 
 class TestLookupYearMocked(unittest.TestCase):
 
+    @patch('tvdb_lookup.get_series_episodes')
+    @patch('tvdb_lookup.get_season_types')
     @patch('tvdb_lookup.find_best_series')
-    def test_year_found(self, mock_find):
+    def test_year_found(self, mock_find, mock_types, mock_eps):
         mock_find.return_value = [('12345', 'Dinosaur Train', '2009', 0.95)]
-        year, conf, name = tv.lookup_year(
-            r'F:\Downloads\Dinosaur Train\episode.avi')
-        self.assertEqual(year, '2009')
-        self.assertGreater(conf, 0.5)
-        self.assertEqual(name, 'Dinosaur Train')
+        mock_types.return_value = []
+        mock_eps.return_value = []
+        result = tv.lookup_all(r'F:\Downloads\Dinosaur Train\episode.avi')
+        self.assertEqual(result['year'], '2009')
+        self.assertGreater(result['year_confidence'], 0.5)
+        self.assertEqual(result['show_name'], 'Dinosaur Train')
 
+    @patch('tvdb_lookup.get_series_episodes')
+    @patch('tvdb_lookup.get_season_types')
     @patch('tvdb_lookup.find_best_series')
-    def test_year_low_confidence(self, mock_find):
+    def test_year_low_confidence(self, mock_find, mock_types, mock_eps):
         mock_find.return_value = [('12345', 'Wrong Show', '2020', 0.3)]
-        year, conf, name = tv.lookup_year(
-            r'F:\Downloads\Dinosaur Train\episode.avi')
-        self.assertIsNone(year)
+        mock_types.return_value = []
+        mock_eps.return_value = []
+        result = tv.lookup_all(r'F:\Downloads\Dinosaur Train\episode.avi')
+        self.assertIsNone(result['year'])
 
     @patch('tvdb_lookup.find_best_series')
     def test_year_no_results(self, mock_find):
         mock_find.return_value = []
-        year, conf, name = tv.lookup_year(
-            r'F:\Downloads\Dinosaur Train\episode.avi')
-        self.assertIsNone(year)
+        result = tv.lookup_all(r'F:\Downloads\Dinosaur Train\episode.avi')
+        self.assertIsNone(result['year'])
 
 
 class TestLookupEpisodeIdMocked(unittest.TestCase):
@@ -846,10 +851,10 @@ class TestLookupEpisodeIdMocked(unittest.TestCase):
         mock_types.return_value = [{'type': 'default', 'name': 'Aired Order'}]
         mock_eps.return_value = DINOSAUR_TRAIN_EPISODES
 
-        result = tv.lookup_episode_id(
+        result = tv.lookup_all(
             r'F:\Downloads\Dinosaur Train\Fast Friends - T Rex Teeth.avi')
         self.assertIsNotNone(result)
-        aired = result['orderings'].get('Aired Order')
+        aired = result['ep_id_orderings'].get('Aired Order')
         self.assertIsNotNone(aired)
         self.assertEqual(aired['tag'], 'S01E11E12')
         self.assertGreater(aired['match_score'], 0.5)
@@ -862,10 +867,10 @@ class TestLookupEpisodeIdMocked(unittest.TestCase):
         mock_types.return_value = [{'type': 'default', 'name': 'Aired Order'}]
         mock_eps.return_value = DINOSAUR_TRAIN_EPISODES
 
-        result = tv.lookup_episode_id(
+        result = tv.lookup_all(
             r'F:\Downloads\Dinosaur Train\Train Trouble.avi')
         self.assertIsNotNone(result)
-        aired = result['orderings'].get('Aired Order')
+        aired = result['ep_id_orderings'].get('Aired Order')
         self.assertIsNotNone(aired)
         self.assertEqual(aired['tag'], 'S01E74')
 
@@ -878,9 +883,9 @@ class TestLookupEpisodeIdMocked(unittest.TestCase):
         mock_eps.return_value = PAW_PATROL_EPISODES
 
         fp = r'F:\Downloads\Paw.Patrol.S01.1080p.NF.WEBRip.DDP5.1.x264-LAZY\Paw.Patrol.S01E07E08.Pup.Pup.Boogie.-.Pups.in.a.Fog.1080p.NF.WEBRip.DDP5.1.x264-LAZY.mkv'
-        result = tv.lookup_episode_id(fp)
+        result = tv.lookup_all(fp)
         self.assertIsNotNone(result)
-        aired = result['orderings'].get('Aired Order')
+        aired = result['ep_id_orderings'].get('Aired Order')
         self.assertIsNotNone(aired)
         self.assertEqual(aired['tag'], 'S01E07E08')
 
@@ -894,9 +899,9 @@ class TestLookupEpisodeIdMocked(unittest.TestCase):
         mock_eps.return_value = PAW_PATROL_EPISODES
 
         fp = r'F:\Downloads\Paw.Patrol.S01.1080p.NF.WEBRip.DDP5.1.x264-LAZY\Paw.Patrol.S01E20.Pups.Save.Christmas.1080p.NF.WEBRip.DDP5.1.x264-LAZY.mkv'
-        result = tv.lookup_episode_id(fp)
+        result = tv.lookup_all(fp)
         self.assertIsNotNone(result)
-        aired = result['orderings'].get('Aired Order')
+        aired = result['ep_id_orderings'].get('Aired Order')
         self.assertIsNotNone(aired)
         self.assertEqual(aired['tag'], 'S01E32')
 
@@ -908,7 +913,7 @@ class TestLookupEpisodeIdMocked(unittest.TestCase):
         mock_types.return_value = [{'type': 'default', 'name': 'Aired Order'}]
         mock_eps.return_value = DINOSAUR_TRAIN_EPISODES
 
-        result = tv.lookup_episode_id(
+        result = tv.lookup_all(
             r'F:\Downloads\Dinosaur Train\Night Train - Fossil Fred.avi')
         self.assertIn('Night Train', result['query_title'])
         self.assertIn('Fossil Fred', result['query_title'])
@@ -925,9 +930,9 @@ class TestLookupEpisodeTitleMocked(unittest.TestCase):
         mock_eps.return_value = PAW_PATROL_EPISODES
 
         fp = r'F:\Shows\Paw.Patrol.S01E19.title.mkv'
-        result = tv.lookup_episode_title(fp)
+        result = tv.lookup_all(fp)
         self.assertIsNotNone(result)
-        aired = result['orderings'].get('Aired Order')
+        aired = result['ep_title_orderings'].get('Aired Order')
         self.assertIsNotNone(aired)
         self.assertEqual(len(aired), 1)
         self.assertEqual(aired[0][2], 'Pups and the Ghost Pirate')
@@ -941,18 +946,19 @@ class TestLookupEpisodeTitleMocked(unittest.TestCase):
         mock_eps.return_value = PAW_PATROL_EPISODES
 
         fp = r'F:\Shows\Paw.Patrol.S01E01E02.title.mkv'
-        result = tv.lookup_episode_title(fp)
+        result = tv.lookup_all(fp)
         self.assertIsNotNone(result)
-        aired = result['orderings'].get('Aired Order')
+        aired = result['ep_title_orderings'].get('Aired Order')
         self.assertEqual(len(aired), 2)
         self.assertEqual(aired[0][2], 'Pups Make a Splash')
         self.assertEqual(aired[1][2], 'Pups Fall Festival')
 
     @patch('tvdb_lookup.find_best_series')
     def test_no_sxxexx_returns_none(self, mock_find):
+        mock_find.return_value = []
         fp = r'F:\Shows\episode without sxxexx.avi'
-        result = tv.lookup_episode_title(fp)
-        self.assertIsNone(result)
+        result = tv.lookup_all(fp)
+        self.assertEqual(result['ep_title_orderings'], {})
 
 
 # ═══════════════════════════════════════════════════════════════════════════

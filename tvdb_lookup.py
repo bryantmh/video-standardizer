@@ -415,74 +415,134 @@ def match_episodes_for_ordering(episodes, season, episode_numbers):
     return matched
 
 
-# ── High-level feature functions ─────────────────────────────────────────
+# ── Orderings builder ────────────────────────────────────────────────────
 
-def lookup_year(filepath):
-    """Feature 1: Look up the year for the series.
+def _build_orderings_for_series(series_id, season_types, title_query,
+                                 season_hint, has_sxxexx, season,
+                                 episode_numbers):
+    """Build ep_id and ep_title orderings for a series.
 
-    Returns (year_str, confidence, series_name) or (None, 0, None).
+    Returns (ep_id_orderings, ep_title_orderings) dicts.
+    Called by lookup_all and by the GUI series-change handler.
     """
-    parsed = parse_filename(filepath)
-    show_name = parsed['show_name'] or guess_show_name(filepath)
-    if not show_name:
-        return None, 0, None
+    ep_id_orderings = {}
+    ep_title_orderings = {}
 
-    matches = find_best_series(show_name)
-    if not matches:
-        return None, 0, None
+    for st in season_types:
+        st_type = st.get('type', 'default')
+        st_name = st.get('name', st_type)
+        try:
+            episodes = get_series_episodes(series_id, st_type)
+        except Exception:
+            continue
+        if not episodes:
+            continue
 
-    best_id, best_name, best_year, score = matches[0]
-    if score < 0.5:
-        return None, score, best_name
-    return best_year, score, best_name
+        # ep_id: match by title
+        if title_query:
+            matches = match_episode_by_title(episodes, title_query, season_hint)
+            if matches:
+                title_parts = re.split(r'\s*[-\u2013]\s+', title_query)
+                title_parts = [p.strip() for p in title_parts if p.strip()]
+                is_multi = len(title_parts) > 1
+
+                all_eps = [
+                    (ep.get('seasonNumber', 0), ep.get('number', 0),
+                     ep.get('name', ''), sc)
+                    for ep, sc in matches
+                ]
+                tag_eps = all_eps if is_multi else all_eps[:1]
+
+                if tag_eps:
+                    ep_season = tag_eps[0][0]
+                    tag = f'S{ep_season:02d}' + ''.join(f'E{e[1]:02d}' for e in tag_eps)
+                    avg_score = sum(e[3] for e in tag_eps) / len(tag_eps)
+                else:
+                    tag = ''
+                    avg_score = 0
+
+                ep_id_orderings[st_name] = {
+                    'type': st_type,
+                    'episodes': all_eps,
+                    'tag_episodes': tag_eps,
+                    'tag': tag,
+                    'match_score': avg_score,
+                }
+
+        # ep_title: match by SxxExx
+        if has_sxxexx and season is not None and episode_numbers:
+            matched = match_episodes_for_ordering(episodes, season, episode_numbers)
+            if matched:
+                ep_title_orderings[st_name] = [
+                    (ep.get('seasonNumber', 0), ep.get('number', 0), ep.get('name', ''))
+                    for ep in matched
+                ]
+
+    return ep_id_orderings, ep_title_orderings
 
 
-def lookup_episode_id(filepath):
-    """Feature 2: Look up S00E00 from episode title.
+# ── Combined lookup (year + ep_id + ep_title in one pass) ───────────────
+
+def lookup_all(filepath):
+    """Combined year + episode-ID + episode-title lookup in a single API pass.
+
+    Fetches series data once (one search, one extended-info, one episode-list
+    per ordering type) and computes all three results without redundant calls.
 
     Returns dict with:
-      orderings: dict of {season_type: {
-          'episodes': [(season, episode, title, score)...],
-          'tag': 'S01E07E08',
-          'match_score': float
-      }}
-      show_name: str
-      series_id: str
-      query_title: str
+      year: str or None
+      year_confidence: float
+      ep_id_orderings: dict (same structure as lookup_episode_id 'orderings')
+      ep_title_orderings: dict (same structure as lookup_episode_title 'orderings')
+      show_name: str or None
+      series_id: str or None
+      series_matches: list
+      query_title: str or None
     """
     parsed = parse_filename(filepath)
     folder_name = guess_show_name(filepath)
 
-    # Determine show name: prefer folder name when no SxxExx or parsed show is empty
+    # Show-name logic from lookup_episode_id (handles SxxExx-less filenames)
     show_name = parsed['show_name']
     if not show_name:
         show_name = folder_name
     elif not parsed['has_sxxexx'] and folder_name:
-        # No SxxExx means parsed show_name is None (episode_title has the filename)
         show_name = folder_name
 
-    if not show_name:
-        return None
+    result = {
+        'year': None, 'year_confidence': 0,
+        'ep_id_orderings': {}, 'ep_title_orderings': {},
+        'show_name': None, 'series_id': None,
+        'series_matches': [], 'query_title': None,
+    }
 
+    if not show_name:
+        return result
+
+    # ── One series search shared across all three features ──────────────
     series_matches = find_best_series(show_name)
     if not series_matches:
-        return None
+        return result
 
-    # Use best series match
-    series_id = series_matches[0][0]
-    series_name = series_matches[0][1]
+    best_id, best_name, best_year, score = series_matches[0]
+    result['show_name'] = best_name
+    result['series_id'] = best_id
+    result['series_matches'] = series_matches[:5]
+    result['year_confidence'] = score
 
-    # Get available season types
-    season_types = get_season_types(series_id)
+    # Year comes straight from the search result — no extra API call
+    if score >= 0.5 and best_year:
+        result['year'] = str(best_year)
+
+    # ── One extended-info call for season types ─────────────────────────
+    season_types = get_season_types(best_id)
     if not season_types:
         season_types = [{'type': 'default', 'name': 'Default'}]
 
-    # Determine what we're searching for
+    # Build ep_id title query (same logic as lookup_episode_id)
     title_query = parsed.get('episode_title')
     if not title_query:
-        # Try the whole filename as the title
         raw = _clean_title(os.path.splitext(os.path.basename(filepath))[0])
-        # Remove show name from the beginning
         if show_name and raw:
             norm_show = _normalize(show_name)
             norm_raw = _normalize(raw)
@@ -492,127 +552,21 @@ def lookup_episode_id(filepath):
                 if leftover:
                     title_query = leftover
         if not title_query:
-            title_query = raw  # last resort
+            title_query = raw
+    result['query_title'] = title_query
 
     season_hint = parsed.get('season')
+    has_sxxexx = parsed.get('has_sxxexx', False)
+    season = parsed.get('season')
+    episode_numbers = parsed.get('episodes')
 
-    orderings = {}
-    for st in season_types:
-        st_type = st.get('type', 'default')
-        st_name = st.get('name', st_type)
-        try:
-            episodes = get_series_episodes(series_id, st_type)
-        except Exception:
-            continue
-        if not episodes:
-            continue
+    result['ep_id_orderings'], result['ep_title_orderings'] = \
+        _build_orderings_for_series(
+            best_id, season_types, title_query,
+            season_hint, has_sxxexx, season, episode_numbers,
+        )
 
-        matches = match_episode_by_title(episodes, title_query, season_hint)
-        if not matches:
-            continue
-
-        # For single-part titles, only use the best match for the tag.
-        # For multi-part titles (A - B), match_episode_by_title already
-        # returns one episode per part.
-        title_parts = re.split(r'\s*[-–]\s+', title_query)
-        title_parts = [p.strip() for p in title_parts if p.strip()]
-        is_multi = len(title_parts) > 1
-
-        # Build episode list: all matches for display, limited for tag
-        all_eps = []
-        for ep, score in matches:
-            all_eps.append((
-                ep.get('seasonNumber', 0),
-                ep.get('number', 0),
-                ep.get('name', ''),
-                score
-            ))
-
-        # For the tag, use all matches if multi-part, else just the best
-        tag_eps = all_eps if is_multi else all_eps[:1]
-
-        # Build SxxExx tag
-        if tag_eps:
-            season = tag_eps[0][0]
-            tag = f'S{season:02d}' + ''.join(f'E{e[1]:02d}' for e in tag_eps)
-            avg_score = sum(e[3] for e in tag_eps) / len(tag_eps)
-        else:
-            tag = ''
-            avg_score = 0
-
-        orderings[st_name] = {
-            'type': st_type,
-            'episodes': all_eps,
-            'tag_episodes': tag_eps,
-            'tag': tag,
-            'match_score': avg_score,
-        }
-
-    return {
-        'orderings': orderings,
-        'show_name': series_name,
-        'series_id': series_id,
-        'series_matches': series_matches[:5],
-        'query_title': title_query,
-    }
-
-
-def lookup_episode_title(filepath):
-    """Feature 3: Look up episode title from S00E00.
-
-    Returns dict with:
-      orderings: dict of {season_type_name: [(season, ep_num, title)...]}
-      show_name: str
-      series_id: str
-    """
-    parsed = parse_filename(filepath)
-    if not parsed['has_sxxexx'] or not parsed['episodes']:
-        return None
-
-    show_name = parsed['show_name'] or guess_show_name(filepath)
-    if not show_name:
-        return None
-
-    series_matches = find_best_series(show_name)
-    if not series_matches:
-        return None
-
-    series_id = series_matches[0][0]
-    series_name = series_matches[0][1]
-
-    season_types = get_season_types(series_id)
-    if not season_types:
-        season_types = [{'type': 'default', 'name': 'Default'}]
-
-    season = parsed['season']
-    episode_numbers = parsed['episodes']
-
-    orderings = {}
-    for st in season_types:
-        st_type = st.get('type', 'default')
-        st_name = st.get('name', st_type)
-        try:
-            episodes = get_series_episodes(series_id, st_type)
-        except Exception:
-            continue
-        if not episodes:
-            continue
-
-        matched = match_episodes_for_ordering(episodes, season, episode_numbers)
-        if matched:
-            orderings[st_name] = [
-                (ep.get('seasonNumber', 0), ep.get('number', 0), ep.get('name', ''))
-                for ep in matched
-            ]
-
-    return {
-        'orderings': orderings,
-        'show_name': series_name,
-        'series_id': series_id,
-        'series_matches': series_matches[:5],
-        'season': season,
-        'episodes': episode_numbers,
-    }
+    return result
 
 
 # ── GUI Integration ─────────────────────────────────────────────────────
@@ -832,24 +786,18 @@ def build_tvdb_popup(parent, filepaths, apply_callback):
             'year': None, 'year_confidence': 0,
             'ep_id_orderings': {},
             'ep_title_orderings': {},
+            'series_matches': [],
+            'selected_series_idx': 0,
+            'query_title': None,
         }
         try:
-            year, conf, _ = lookup_year(fp)
-            if year:
-                data['year'] = str(year)
-                data['year_confidence'] = conf
-        except Exception:
-            pass
-        try:
-            ep_result = lookup_episode_id(fp)
-            if ep_result and ep_result.get('orderings'):
-                data['ep_id_orderings'] = ep_result['orderings']
-        except Exception:
-            pass
-        try:
-            title_result = lookup_episode_title(fp)
-            if title_result and title_result.get('orderings'):
-                data['ep_title_orderings'] = title_result['orderings']
+            result = lookup_all(fp)
+            data['year'] = result.get('year')
+            data['year_confidence'] = result.get('year_confidence', 0)
+            data['ep_id_orderings'] = result.get('ep_id_orderings', {})
+            data['ep_title_orderings'] = result.get('ep_title_orderings', {})
+            data['series_matches'] = result.get('series_matches', [])
+            data['query_title'] = result.get('query_title')
         except Exception:
             pass
         return data
@@ -868,6 +816,8 @@ def build_tvdb_popup(parent, filepaths, apply_callback):
         row_selected.clear()
         ordering_combo.set('Best (Auto)')
         global_ordering.set('')
+        series_combo.set('')
+        series_combo.configure(state='disabled')
         _lookup_file_at(0)
 
     def _lookup_file_at(idx):
@@ -879,6 +829,7 @@ def build_tvdb_popup(parent, filepaths, apply_callback):
             status_var.set(
                 f"Done — {len(row_data_list)} files  ·  "
                 f"{n_id} with Episode ID  ·  {n_ti} with Title")
+            _populate_series_combo()
             _update_status()
             return
         fp = filepaths[idx]
@@ -956,6 +907,16 @@ def build_tvdb_popup(parent, filepaths, apply_callback):
     ordering_combo.pack(side=tk.LEFT)
     ordering_combo.bind('<<ComboboxSelected>>', _on_ordering_selected)
 
+    ttk.Separator(ctrl_frame, orient=tk.VERTICAL).pack(
+        side=tk.LEFT, fill=tk.Y, padx=(12, 12), pady=2)
+
+    tk.Label(ctrl_frame, text="Series:", font=("Consolas", 10),
+             bg=_BG, fg=_FG).pack(side=tk.LEFT, padx=(0, 4))
+    series_combo = ttk.Combobox(ctrl_frame, values=[], width=34,
+                                 state='disabled', font=("Consolas", 10))
+    series_combo.pack(side=tk.LEFT)
+    # series_combo event binding added below after _on_series_selected is defined
+
     ttk.Separator(popup, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=8, pady=4)
 
     # ── Layout: Treeview Table ────────────────────────────────────
@@ -1000,14 +961,82 @@ def build_tvdb_popup(parent, filepaths, apply_callback):
 
     def _on_tree_click(event):
         if tree.identify_region(event.x, event.y) == 'cell':
-            if tree.identify_column(event.x) == '#1':
-                iid = tree.identify_row(event.y)
-                if iid:
-                    _toggle_row(iid)
+            iid = tree.identify_row(event.y)
+            if iid and tree.identify_column(event.x) == '#1':
+                _toggle_row(iid)
 
     tree.bind('<ButtonRelease-1>', _on_tree_click)
     tree.bind('<MouseWheel>',
               lambda e: tree.yview_scroll(int(-1 * (e.delta / 120)), 'units'))
+
+    # ── Series selector (global) ───────────────────────────────
+
+    def _recompute_series_for_row(r, series_idx):
+        """Re-run orderings for one row using a different series match."""
+        matches_list = r.get('series_matches', [])
+        if not matches_list or series_idx >= len(matches_list):
+            return
+        series_id, series_name, series_year, series_score = matches_list[series_idx]
+        r['selected_series_idx'] = series_idx
+        r['year'] = str(series_year) if (series_score >= 0.5 and series_year) else None
+        r['year_confidence'] = series_score
+        try:
+            season_types = get_season_types(series_id)
+            if not season_types:
+                season_types = [{'type': 'default', 'name': 'Default'}]
+        except Exception:
+            season_types = [{'type': 'default', 'name': 'Default'}]
+        parsed = parse_filename(r['filepath'])
+        r['ep_id_orderings'], r['ep_title_orderings'] = _build_orderings_for_series(
+            series_id, season_types, r.get('query_title'),
+            parsed.get('season'), parsed.get('has_sxxexx', False),
+            parsed.get('season'), parsed.get('episodes'),
+        )
+        _redraw_row(r['iid'])
+
+    def _populate_series_combo():
+        """Populate the series combo from the first row's matches."""
+        if not row_data_list:
+            series_combo['values'] = []
+            series_combo.set('')
+            series_combo.configure(state='disabled')
+            return
+        matches_list = row_data_list[0].get('series_matches', [])
+        if not matches_list:
+            series_combo['values'] = []
+            series_combo.set('No matches')
+            series_combo.configure(state='disabled')
+            return
+        choices = [
+            f"{name} ({year})  {score:.0%}" if year else f"{name}  {score:.0%}"
+            for _, name, year, score in matches_list
+        ]
+        series_combo['values'] = choices
+        cur_idx = row_data_list[0].get('selected_series_idx', 0)
+        series_combo.set(choices[cur_idx] if cur_idx < len(choices) else choices[0])
+        series_combo.configure(state='readonly')
+
+    def _on_series_selected(event=None):
+        matches_list = row_data_list[0].get('series_matches', []) if row_data_list else []
+        choices = [
+            f"{name} ({year})  {score:.0%}" if year else f"{name}  {score:.0%}"
+            for _, name, year, score in matches_list
+        ]
+        val = series_combo.get()
+        if val not in choices:
+            return
+        new_idx = choices.index(val)
+        if not row_data_list or new_idx == row_data_list[0].get('selected_series_idx', 0):
+            return
+        status_var.set("Re-looking up with new series...")
+        popup.update_idletasks()
+        for r in row_data_list:
+            _recompute_series_for_row(r, new_idx)
+        _populate_ordering_combo()
+        _refresh_results()
+        _update_status()
+
+    series_combo.bind('<<ComboboxSelected>>', _on_series_selected)
 
     # ── Layout: Bottom Bar ───────────────────────────────────────
     bottom_frame = tk.Frame(popup, bg=_BG)
