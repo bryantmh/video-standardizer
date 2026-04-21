@@ -62,6 +62,20 @@ def get_all_streams(input_file):
     return json.loads(result.stdout)
 
 
+def _audio_rank_key(stream):
+    """Rank an audio stream for 'best track' selection.
+
+    Priority: channels, then bitrate. (Language is handled by grouping upstream.)
+    Missing values sort lowest so a stream with real data beats an unknown one.
+    """
+    channels = stream.get('channels') or 0
+    try:
+        bitrate = int(stream.get('bit_rate') or 0)
+    except (TypeError, ValueError):
+        bitrate = 0
+    return (channels, bitrate)
+
+
 def select_audio_tracks(streams, keep_languages=None):
     """Select the best audio track per kept language.
 
@@ -83,13 +97,13 @@ def select_audio_tracks(streams, keep_languages=None):
 
     for lang in keep_languages:
         if lang in lang_groups:
-            best_idx, _ = max(lang_groups[lang], key=lambda x: x[1].get('channels', 0))
+            best_idx, _ = max(lang_groups[lang], key=lambda x: _audio_rank_key(x[1]))
             selected.append((best_idx, lang, False))
 
     has_eng = any(s[1] == 'eng' for s in selected)
     for und_lang in ['und', 'unk', '']:
         if und_lang in lang_groups and not has_eng:
-            best_idx, _ = max(lang_groups[und_lang], key=lambda x: x[1].get('channels', 0))
+            best_idx, _ = max(lang_groups[und_lang], key=lambda x: _audio_rank_key(x[1]))
             selected.append((best_idx, 'eng', True))
             has_eng = True
             break
