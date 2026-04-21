@@ -197,24 +197,31 @@ def build_output_filename(input_file, extension, streams, format_info,
 
     tc = tvdb_changes or {}
 
-    # Use TVDB sxxexx if provided and it looks like a valid SxxExx tag,
-    # otherwise extract from filename
-    _sxxexx_pattern = re.compile(r'^[Ss]\d{1,2}(?:[Ee]\d{1,3})+$')
-    raw_sxxexx = tc.get('sxxexx') or ''
-    valid_sxxexx = raw_sxxexx if _sxxexx_pattern.match(raw_sxxexx) else ''
+    # Movie mode: TVDB gave us a canonical title — replace the filename base
+    # entirely and skip any SxxExx handling.
+    movie_title = tc.get('movie_title')
 
-    if valid_sxxexx:
-        tag = valid_sxxexx
-        suffix = tc.get('episode_title', '') or ''
+    if movie_title:
+        filename = movie_title
     else:
-        tag, suffix, _ = extract_episode_info(basename, keep_suffix=keep_suffix)
-        if tag and tc.get('episode_title'):
-            suffix = tc['episode_title']
+        # Use TVDB sxxexx if provided and it looks like a valid SxxExx tag,
+        # otherwise extract from filename
+        _sxxexx_pattern = re.compile(r'^[Ss]\d{1,2}(?:[Ee]\d{1,3})+$')
+        raw_sxxexx = tc.get('sxxexx') or ''
+        valid_sxxexx = raw_sxxexx if _sxxexx_pattern.match(raw_sxxexx) else ''
 
-    if tag:
-        filename = tag + (suffix or '')
-    else:
-        filename = os.path.splitext(basename)[0]
+        if valid_sxxexx:
+            tag = valid_sxxexx
+            suffix = tc.get('episode_title', '') or ''
+        else:
+            tag, suffix, _ = extract_episode_info(basename, keep_suffix=keep_suffix)
+            if tag and tc.get('episode_title'):
+                suffix = tc['episode_title']
+
+        if tag:
+            filename = tag + (suffix or '')
+        else:
+            filename = os.path.splitext(basename)[0]
 
     resolution = get_resolution(streams)
     bitrate = get_bitrate(format_info)
@@ -892,6 +899,29 @@ def launch_gui(terminal_cwd=None):
             list_scroll.pack(side=tk.RIGHT, fill=tk.Y)
             self.file_listbox.pack(fill=tk.BOTH, expand=True)
 
+            # Shift-click selects the range from the last clicked row to the
+            # shift-clicked row (additive — existing selections are preserved).
+            # MULTIPLE selectmode doesn't give us this natively.
+            self._last_click_idx = None
+
+            def _on_listbox_click(event):
+                idx = self.file_listbox.nearest(event.y)
+                if idx >= 0:
+                    self._last_click_idx = idx
+
+            def _on_listbox_shift_click(event):
+                idx = self.file_listbox.nearest(event.y)
+                if idx < 0:
+                    return 'break'
+                anchor = self._last_click_idx if self._last_click_idx is not None else idx
+                lo, hi = (anchor, idx) if anchor <= idx else (idx, anchor)
+                self.file_listbox.selection_set(lo, hi)
+                self._last_click_idx = idx
+                return 'break'
+
+            self.file_listbox.bind('<Button-1>', _on_listbox_click, add='+')
+            self.file_listbox.bind('<Shift-Button-1>', _on_listbox_shift_click)
+
             list_btn_row = ttk.Frame(list_frame)
             list_btn_row.pack(fill=tk.X, padx=5, pady=(0, 5))
             ttk.Button(list_btn_row, text="Show Plan",
@@ -1011,9 +1041,14 @@ def launch_gui(terminal_cwd=None):
             try:
                 raw = self.file_listbox.get(index)
                 base = raw[2:] if len(raw) >= 2 else raw
+                # Tk's delete+insert drops the selection for this index; preserve
+                # it so runs (including dry runs) don't clear the user's picks.
+                was_selected = self.file_listbox.selection_includes(index)
                 self.file_listbox.delete(index)
                 self.file_listbox.insert(index, f"{icons.get(status, '  ')}{base}")
                 self.file_listbox.itemconfig(index, fg=colors.get(status, '#cccccc'))
+                if was_selected:
+                    self.file_listbox.selection_set(index)
             except Exception:
                 pass
 
@@ -1142,12 +1177,26 @@ def launch_gui(terminal_cwd=None):
                 self._log(f"TVDB changes queued for {os.path.basename(filepath)}:", 'info')
                 if changes.get('year'):
                     self._log(f"  Year: ({changes['year']})", 'keep')
+                if changes.get('movie_title'):
+                    self._log(f"  Movie Title: {changes['movie_title']}", 'keep')
                 if changes.get('sxxexx'):
                     self._log(f"  Episode ID: {changes['sxxexx']}", 'keep')
                 if changes.get('episode_title'):
                     self._log(f"  Episode Title: {changes['episode_title']}", 'keep')
 
-            build_tvdb_popup(self.root, files, _apply_cb)
+            def _on_apply_done(applied_paths):
+                # Sync the main file list selection to match what the user
+                # picked in the popup: clear current selection, then reselect
+                # exactly the files that had changes applied.
+                idx_by_path = {p: i for i, p in enumerate(self._file_paths)}
+                self.file_listbox.selection_clear(0, tk.END)
+                for p in applied_paths:
+                    i = idx_by_path.get(p)
+                    if i is not None:
+                        self.file_listbox.selection_set(i)
+
+            build_tvdb_popup(self.root, files, _apply_cb,
+                             on_apply_done=_on_apply_done)
 
         # ── Run / Stop ───────────────────────────────────────────────────
 

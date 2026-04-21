@@ -249,6 +249,17 @@ def search_series(name):
     return data or []
 
 
+def search_movies(name, year=None):
+    """Search TVDB for a movie by name (and optionally a year hint)."""
+    if not name:
+        return []
+    params = {'query': name, 'type': 'movie'}
+    if year:
+        params['year'] = str(year)
+    data = _api_get('/search', params)
+    return data or []
+
+
 def get_series_extended(series_id):
     """Get extended series info including season types."""
     return _api_get(f'/series/{series_id}/extended', {'short': 'true'})
@@ -306,7 +317,7 @@ def _similarity(a, b):
 
 def find_best_series(show_name):
     """Search TVDB and return best-matching series.
-    
+
     Returns list of (series_id, name, year, score) sorted by match quality.
     """
     results = search_series(show_name)
@@ -316,6 +327,29 @@ def find_best_series(show_name):
         year = r.get('year', '')
         tvdb_id = r.get('tvdb_id', r.get('id', ''))
         sim = _similarity(show_name, name)
+        scored.append((str(tvdb_id), name, year, sim))
+    scored.sort(key=lambda x: -x[3])
+    return scored
+
+
+def find_best_movie(title, year_hint=None):
+    """Search TVDB for a movie and rank results by title similarity.
+
+    If year_hint is provided, results whose year matches get a small boost.
+    Returns list of (movie_id, name, year, score) sorted by match quality.
+    """
+    results = search_movies(title, year=year_hint)
+    # If a year-constrained query returns nothing, retry unconstrained.
+    if not results and year_hint:
+        results = search_movies(title)
+    scored = []
+    for r in results[:15]:
+        name = r.get('name', '')
+        year = r.get('year', '')
+        tvdb_id = r.get('tvdb_id', r.get('id', ''))
+        sim = _similarity(title, name)
+        if year_hint and year and str(year) == str(year_hint):
+            sim = min(1.0, sim + 0.1)
         scored.append((str(tvdb_id), name, year, sim))
     scored.sort(key=lambda x: -x[3])
     return scored
@@ -481,6 +515,68 @@ def _build_orderings_for_series(series_id, season_types, title_query,
     return ep_id_orderings, ep_title_orderings
 
 
+# ── Movie lookup ─────────────────────────────────────────────────────────
+
+def parse_movie_filename(filepath):
+    """Extract a clean movie title + optional year from a filename.
+
+    Returns dict: {'title': str or None, 'year': str or None}
+    """
+    basename = os.path.basename(filepath)
+    name_no_ext = os.path.splitext(basename)[0]
+
+    # Pull a (YYYY) or .YYYY. year, if any, before _clean_title strips it.
+    year = None
+    m = re.search(r'\((\d{4})\)', name_no_ext)
+    if m:
+        year = m.group(1)
+    else:
+        m = re.search(r'[.\s_\-](19\d{2}|20\d{2})(?:[.\s_\-]|$)', name_no_ext)
+        if m:
+            year = m.group(1)
+
+    title = _clean_title(name_no_ext)
+
+    # If the year was embedded mid-string without surrounding delimiters that
+    # _clean_title would match (e.g. trailing "... 1994"), strip it off.
+    if year and title.endswith(year):
+        title = title[:-len(year)].rstrip(' -.')
+
+    return {'title': title or None, 'year': year}
+
+
+def lookup_movie(filepath):
+    """Search TVDB for a movie matching `filepath`.
+
+    Returns dict with:
+      title: canonical movie title (or None)
+      year: str or None
+      score: float 0..1
+      matches: list of (movie_id, name, year, score)  (alternates, up to 5)
+      query_title: the cleaned filename stem used as the query
+    """
+    parsed = parse_movie_filename(filepath)
+    result = {
+        'title': None, 'year': None, 'score': 0,
+        'matches': [], 'query_title': parsed['title'],
+    }
+    if not parsed['title']:
+        return result
+
+    matches = find_best_movie(parsed['title'], year_hint=parsed['year'])
+    if not matches:
+        return result
+
+    _movie_id, name, year, score = matches[0]
+    result['matches'] = matches[:5]
+    result['score'] = score
+    if score >= 0.5:
+        result['title'] = name
+        if year:
+            result['year'] = str(year)
+    return result
+
+
 # ── Combined lookup (year + ep_id + ep_title in one pass) ───────────────
 
 def lookup_all(filepath):
@@ -571,13 +667,17 @@ def lookup_all(filepath):
 
 # ── GUI Integration ─────────────────────────────────────────────────────
 
-def build_tvdb_popup(parent, filepaths, apply_callback):
+def build_tvdb_popup(parent, filepaths, apply_callback, on_apply_done=None):
     """Create the TVDB Lookup popup window with compact table view.
 
     parent: tk root window
     filepaths: list of file paths to look up
-    apply_callback: function(filepath, changes_dict) called when user applies changes.
-        changes_dict has keys: 'year', 'sxxexx', 'episode_title'
+    apply_callback: function(filepath, changes_dict) called once per file the
+        user selected to apply. changes_dict keys: 'year', 'sxxexx',
+        'episode_title', 'movie_title'.
+    on_apply_done: optional function(applied_filepaths) called after all
+        per-file apply_callback calls finish, before the popup closes. Lets the
+        caller sync its own UI selection to the popup's selection.
     """
     import tkinter as tk
     from tkinter import ttk
@@ -614,8 +714,9 @@ def build_tvdb_popup(parent, filepaths, apply_callback):
 
     # ── State ────────────────────────────────────────────────────
     global_year = tk.BooleanVar(value=False)   # Year OFF by default
-    global_mode = tk.StringVar(value='ep_id')  # 'ep_id' or 'ep_title'
+    global_mode = tk.StringVar(value='ep_id')  # 'ep_id' or 'ep_title' (TV only)
     global_ordering = tk.StringVar(value='')   # '' = best auto
+    content_type = tk.StringVar(value='tv')    # 'tv' or 'movie'
     row_data_list = []       # list of dicts (one per file)
     row_selected = {}        # iid -> bool
 
@@ -698,11 +799,14 @@ def build_tvdb_popup(parent, filepaths, apply_callback):
         parts = []
         if global_year.get():
             parts.append("Year")
-        mode = global_mode.get()
-        if mode == 'ep_id':
-            parts.append("Episode ID")
-        elif mode == 'ep_title':
-            parts.append("Episode Title")
+        if content_type.get() == 'movie':
+            parts.append("Movie Title")
+        else:
+            mode = global_mode.get()
+            if mode == 'ep_id':
+                parts.append("Episode ID")
+            elif mode == 'ep_title':
+                parts.append("Episode Title")
         what = ', '.join(parts) if parts else 'Nothing'
         status_var.set(f"{n_sel}/{len(row_data_list)} selected  ·  Applying: {what}")
 
@@ -714,24 +818,37 @@ def build_tvdb_popup(parent, filepaths, apply_callback):
         sel_text = '☑' if sel else '☐'
         year_text = f"({r['year']})" if r.get('year') else ''
 
-        mode = global_mode.get()
-        if mode == 'ep_id':
-            ep_tag, score, detail, _ = _get_ep_id_for_row(r)
-            result_text = ep_tag or '—'
-            score_text = f"{score:.0%}" if ep_tag else ''
-            detail_text = detail
-            if ep_tag:
+        if content_type.get() == 'movie':
+            title = r.get('movie_title')
+            score = r.get('movie_score', 0)
+            result_text = title or '—'
+            score_text = f"{score:.0%}" if title else ''
+            detail_text = r.get('query_title', '') or ''
+            if title:
                 row_tag = ('score_green' if score >= 0.8
                            else 'score_yellow' if score >= 0.6
                            else 'score_red')
             else:
                 row_tag = 'dim'
         else:
-            display, _, _, ord_name = _get_ep_title_for_row(r)
-            result_text = display or '—'
-            score_text = ''
-            detail_text = f'[{ord_name}]' if ord_name else ''
-            row_tag = 'ep_title' if display else 'dim'
+            mode = global_mode.get()
+            if mode == 'ep_id':
+                ep_tag, score, detail, _ = _get_ep_id_for_row(r)
+                result_text = ep_tag or '—'
+                score_text = f"{score:.0%}" if ep_tag else ''
+                detail_text = detail
+                if ep_tag:
+                    row_tag = ('score_green' if score >= 0.8
+                               else 'score_yellow' if score >= 0.6
+                               else 'score_red')
+                else:
+                    row_tag = 'dim'
+            else:
+                display, _, _, ord_name = _get_ep_title_for_row(r)
+                result_text = display or '—'
+                score_text = ''
+                detail_text = f'[{ord_name}]' if ord_name else ''
+                row_tag = 'ep_title' if display else 'dim'
 
         if not sel:
             row_tag = 'unsel'
@@ -789,15 +906,30 @@ def build_tvdb_popup(parent, filepaths, apply_callback):
             'series_matches': [],
             'selected_series_idx': 0,
             'query_title': None,
+            # Movie-mode fields
+            'movie_title': None,
+            'movie_score': 0,
+            'movie_matches': [],
+            'selected_movie_idx': 0,
         }
         try:
-            result = lookup_all(fp)
-            data['year'] = result.get('year')
-            data['year_confidence'] = result.get('year_confidence', 0)
-            data['ep_id_orderings'] = result.get('ep_id_orderings', {})
-            data['ep_title_orderings'] = result.get('ep_title_orderings', {})
-            data['series_matches'] = result.get('series_matches', [])
-            data['query_title'] = result.get('query_title')
+            if content_type.get() == 'movie':
+                mres = lookup_movie(fp)
+                data['movie_title'] = mres.get('title')
+                data['movie_score'] = mres.get('score', 0)
+                data['movie_matches'] = mres.get('matches', [])
+                data['query_title'] = mres.get('query_title')
+                if mres.get('year'):
+                    data['year'] = mres['year']
+                    data['year_confidence'] = mres.get('score', 0)
+            else:
+                result = lookup_all(fp)
+                data['year'] = result.get('year')
+                data['year_confidence'] = result.get('year_confidence', 0)
+                data['ep_id_orderings'] = result.get('ep_id_orderings', {})
+                data['ep_title_orderings'] = result.get('ep_title_orderings', {})
+                data['series_matches'] = result.get('series_matches', [])
+                data['query_title'] = result.get('query_title')
         except Exception:
             pass
         return data
@@ -824,11 +956,17 @@ def build_tvdb_popup(parent, filepaths, apply_callback):
         if idx >= len(filepaths):
             _populate_ordering_combo()
             _refresh_results()
-            n_id = sum(1 for r in row_data_list if r.get('ep_id_orderings'))
-            n_ti = sum(1 for r in row_data_list if r.get('ep_title_orderings'))
-            status_var.set(
-                f"Done — {len(row_data_list)} files  ·  "
-                f"{n_id} with Episode ID  ·  {n_ti} with Title")
+            if content_type.get() == 'movie':
+                n_found = sum(1 for r in row_data_list if r.get('movie_title'))
+                status_var.set(
+                    f"Done — {len(row_data_list)} files  ·  "
+                    f"{n_found} with Movie match")
+            else:
+                n_id = sum(1 for r in row_data_list if r.get('ep_id_orderings'))
+                n_ti = sum(1 for r in row_data_list if r.get('ep_title_orderings'))
+                status_var.set(
+                    f"Done — {len(row_data_list)} files  ·  "
+                    f"{n_id} with Episode ID  ·  {n_ti} with Title")
             _populate_series_combo()
             _update_status()
             return
@@ -844,15 +982,23 @@ def build_tvdb_popup(parent, filepaths, apply_callback):
         popup.after(1, lambda: _lookup_file_at(idx + 1))
 
     def _apply():
+        is_movie = content_type.get() == 'movie'
         mode = global_mode.get()
+        applied_paths = []
         for r in row_data_list:
             iid = r.get('iid')
             if not row_selected.get(iid, True):
                 continue
-            changes = {'year': None, 'sxxexx': None, 'episode_title': None}
+            changes = {
+                'year': None, 'sxxexx': None,
+                'episode_title': None, 'movie_title': None,
+            }
             if global_year.get() and r.get('year'):
                 changes['year'] = r['year']
-            if mode == 'ep_id':
+            if is_movie:
+                if r.get('movie_title'):
+                    changes['movie_title'] = r['movie_title']
+            elif mode == 'ep_id':
                 ep_tag, _, _, suffix = _get_ep_id_for_row(r)
                 if ep_tag:
                     changes['sxxexx'] = ep_tag
@@ -866,11 +1012,35 @@ def build_tvdb_popup(parent, filepaths, apply_callback):
                     changes['sxxexx'] = sxxexx_tag
             if any(v is not None for v in changes.values()):
                 apply_callback(r['filepath'], changes)
+                applied_paths.append(r['filepath'])
+        if on_apply_done is not None:
+            try:
+                on_apply_done(applied_paths)
+            except Exception:
+                pass
         popup.destroy()
 
     # ── Layout: Global Controls ──────────────────────────────────
     ctrl_frame = tk.Frame(popup, bg=_BG)
     ctrl_frame.pack(fill=tk.X, padx=10, pady=(8, 2))
+
+    tk.Label(ctrl_frame, text="Type:", font=("Consolas", 10, "bold"),
+             bg=_BG, fg=_FG).pack(side=tk.LEFT, padx=(0, 8))
+
+    # Content-type toggle (TV / Movie) — driven by a callback defined later.
+    type_tv_btn = tk.Radiobutton(ctrl_frame, text="TV Show",
+                   variable=content_type, value='tv',
+                   font=("Consolas", 10), bg=_BG, fg=_FG,
+                   selectcolor=_ENT, activebackground=_BG, activeforeground=_FG)
+    type_tv_btn.pack(side=tk.LEFT, padx=(0, 4))
+    type_movie_btn = tk.Radiobutton(ctrl_frame, text="Movie",
+                   variable=content_type, value='movie',
+                   font=("Consolas", 10), bg=_BG, fg=_FG,
+                   selectcolor=_ENT, activebackground=_BG, activeforeground=_FG)
+    type_movie_btn.pack(side=tk.LEFT, padx=(0, 12))
+
+    ttk.Separator(ctrl_frame, orient=tk.VERTICAL).pack(
+        side=tk.LEFT, fill=tk.Y, padx=(0, 12), pady=2)
 
     tk.Label(ctrl_frame, text="Apply:", font=("Consolas", 10, "bold"),
              bg=_BG, fg=_FG).pack(side=tk.LEFT, padx=(0, 8))
@@ -880,38 +1050,44 @@ def build_tvdb_popup(parent, filepaths, apply_callback):
                    selectcolor=_ENT, activebackground=_BG, activeforeground=_FG,
                    command=_update_status).pack(side=tk.LEFT, padx=(0, 12))
 
-    ttk.Separator(ctrl_frame, orient=tk.VERTICAL).pack(
-        side=tk.LEFT, fill=tk.Y, padx=(0, 12), pady=2)
+    # TV-only controls live in their own frame so we can hide/show them
+    # as a unit when the user toggles between TV and Movie mode.
+    tv_only_frame = tk.Frame(ctrl_frame, bg=_BG)
+    tv_only_frame.pack(side=tk.LEFT)
 
-    tk.Radiobutton(ctrl_frame, text="Episode ID (S00E00)",
+    tv_sep1 = ttk.Separator(tv_only_frame, orient=tk.VERTICAL)
+    tv_sep1.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 12), pady=2)
+
+    tk.Radiobutton(tv_only_frame, text="Episode ID (S00E00)",
                    variable=global_mode, value='ep_id',
                    font=("Consolas", 10), bg=_BG, fg=_FG,
                    selectcolor=_ENT, activebackground=_BG, activeforeground=_FG,
                    command=_refresh_results).pack(side=tk.LEFT, padx=(0, 10))
 
-    tk.Radiobutton(ctrl_frame, text="Episode Title",
+    tk.Radiobutton(tv_only_frame, text="Episode Title",
                    variable=global_mode, value='ep_title',
                    font=("Consolas", 10), bg=_BG, fg=_FG,
                    selectcolor=_ENT, activebackground=_BG, activeforeground=_FG,
                    command=_refresh_results).pack(side=tk.LEFT, padx=(0, 16))
 
-    ttk.Separator(ctrl_frame, orient=tk.VERTICAL).pack(
-        side=tk.LEFT, fill=tk.Y, padx=(0, 12), pady=2)
+    tv_sep2 = ttk.Separator(tv_only_frame, orient=tk.VERTICAL)
+    tv_sep2.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 12), pady=2)
 
-    tk.Label(ctrl_frame, text="Ordering:", font=("Consolas", 10),
+    tk.Label(tv_only_frame, text="Ordering:", font=("Consolas", 10),
              bg=_BG, fg=_FG).pack(side=tk.LEFT, padx=(0, 4))
-    ordering_combo = ttk.Combobox(ctrl_frame, values=['Best (Auto)'],
+    ordering_combo = ttk.Combobox(tv_only_frame, values=['Best (Auto)'],
                                    width=22, state='readonly',
                                    font=("Consolas", 10))
     ordering_combo.set('Best (Auto)')
     ordering_combo.pack(side=tk.LEFT)
     ordering_combo.bind('<<ComboboxSelected>>', _on_ordering_selected)
 
-    ttk.Separator(ctrl_frame, orient=tk.VERTICAL).pack(
-        side=tk.LEFT, fill=tk.Y, padx=(12, 12), pady=2)
+    match_sep = ttk.Separator(ctrl_frame, orient=tk.VERTICAL)
+    match_sep.pack(side=tk.LEFT, fill=tk.Y, padx=(12, 12), pady=2)
 
-    tk.Label(ctrl_frame, text="Series:", font=("Consolas", 10),
-             bg=_BG, fg=_FG).pack(side=tk.LEFT, padx=(0, 4))
+    match_label = tk.Label(ctrl_frame, text="Series:", font=("Consolas", 10),
+             bg=_BG, fg=_FG)
+    match_label.pack(side=tk.LEFT, padx=(0, 4))
     series_combo = ttk.Combobox(ctrl_frame, values=[], width=34,
                                  state='disabled', font=("Consolas", 10))
     series_combo.pack(side=tk.LEFT)
@@ -959,15 +1135,82 @@ def build_tvdb_popup(parent, filepaths, apply_callback):
     tree.tag_configure('dim',          foreground=_FG_DIM)
     tree.tag_configure('unsel',        foreground=_FG_DIM)
 
+    # Per-row movie picker — a floating Combobox positioned over the Result
+    # cell of the clicked row. Only appears in movie mode.
+    _row_picker = {'combo': None, 'iid': None}
+
+    def _close_row_picker(event=None):
+        combo = _row_picker.get('combo')
+        if combo is not None:
+            try:
+                combo.destroy()
+            except Exception:
+                pass
+        _row_picker['combo'] = None
+        _row_picker['iid'] = None
+
+    def _open_movie_row_picker(iid):
+        _close_row_picker()
+        r = next((rd for rd in row_data_list if rd.get('iid') == iid), None)
+        if r is None:
+            return
+        matches_list = r.get('movie_matches', [])
+        if not matches_list:
+            return
+        bbox = tree.bbox(iid, column='result')
+        if not bbox:
+            return
+        x, y, w, h = bbox
+        choices = _match_choices(matches_list)
+        combo = ttk.Combobox(tree, values=choices, state='readonly',
+                             font=("Consolas", 9))
+        cur_idx = r.get('selected_movie_idx', 0)
+        combo.set(choices[cur_idx] if cur_idx < len(choices) else choices[0])
+        combo.place(x=x, y=y, width=max(w, 260), height=h)
+        _row_picker['combo'] = combo
+        _row_picker['iid'] = iid
+
+        def _on_pick(event=None):
+            val = combo.get()
+            if val in choices:
+                new_idx = choices.index(val)
+                if new_idx != r.get('selected_movie_idx', 0):
+                    _recompute_movie_for_row(r, new_idx)
+                    _update_status()
+            _close_row_picker()
+
+        combo.bind('<<ComboboxSelected>>', _on_pick)
+        combo.bind('<Escape>', lambda e: _close_row_picker())
+        combo.bind('<FocusOut>', lambda e: _close_row_picker())
+        # Open the dropdown immediately so the user doesn't need a second click
+        combo.focus_set()
+        combo.event_generate('<Button-1>')
+
     def _on_tree_click(event):
-        if tree.identify_region(event.x, event.y) == 'cell':
-            iid = tree.identify_row(event.y)
-            if iid and tree.identify_column(event.x) == '#1':
-                _toggle_row(iid)
+        if tree.identify_region(event.x, event.y) != 'cell':
+            _close_row_picker()
+            return
+        iid = tree.identify_row(event.y)
+        if not iid:
+            return
+        col = tree.identify_column(event.x)
+        if col == '#1':
+            _close_row_picker()
+            _toggle_row(iid)
+        elif col == '#4' and content_type.get() == 'movie':
+            _open_movie_row_picker(iid)
+        else:
+            _close_row_picker()
 
     tree.bind('<ButtonRelease-1>', _on_tree_click)
-    tree.bind('<MouseWheel>',
-              lambda e: tree.yview_scroll(int(-1 * (e.delta / 120)), 'units'))
+
+    # Scroll wheel: close any open per-row picker, otherwise it'd hover over
+    # the wrong row once the underlying cell moves.
+    def _on_tree_wheel(e):
+        _close_row_picker()
+        tree.yview_scroll(int(-1 * (e.delta / 120)), 'units')
+
+    tree.bind('<MouseWheel>', _on_tree_wheel)
 
     # ── Series selector (global) ───────────────────────────────
 
@@ -994,9 +1237,31 @@ def build_tvdb_popup(parent, filepaths, apply_callback):
         )
         _redraw_row(r['iid'])
 
+    def _recompute_movie_for_row(r, movie_idx):
+        """Switch this row to a different movie match from its candidate list."""
+        matches_list = r.get('movie_matches', [])
+        if not matches_list or movie_idx >= len(matches_list):
+            return
+        _movie_id, name, year, score = matches_list[movie_idx]
+        r['selected_movie_idx'] = movie_idx
+        r['movie_title'] = name if score >= 0.5 else None
+        r['movie_score'] = score
+        r['year'] = str(year) if (score >= 0.5 and year) else None
+        r['year_confidence'] = score
+        _redraw_row(r['iid'])
+
+    def _match_choices(matches_list):
+        return [
+            f"{name} ({year})  {score:.0%}" if year else f"{name}  {score:.0%}"
+            for _, name, year, score in matches_list
+        ]
+
     def _populate_series_combo():
-        """Populate the series combo from the first row's matches."""
-        if not row_data_list:
+        """Populate the top-bar series combo from the first row's matches.
+
+        Only used in TV mode — movies get a per-row dropdown instead.
+        """
+        if content_type.get() == 'movie' or not row_data_list:
             series_combo['values'] = []
             series_combo.set('')
             series_combo.configure(state='disabled')
@@ -1007,28 +1272,24 @@ def build_tvdb_popup(parent, filepaths, apply_callback):
             series_combo.set('No matches')
             series_combo.configure(state='disabled')
             return
-        choices = [
-            f"{name} ({year})  {score:.0%}" if year else f"{name}  {score:.0%}"
-            for _, name, year, score in matches_list
-        ]
+        choices = _match_choices(matches_list)
         series_combo['values'] = choices
         cur_idx = row_data_list[0].get('selected_series_idx', 0)
         series_combo.set(choices[cur_idx] if cur_idx < len(choices) else choices[0])
         series_combo.configure(state='readonly')
 
     def _on_series_selected(event=None):
-        matches_list = row_data_list[0].get('series_matches', []) if row_data_list else []
-        choices = [
-            f"{name} ({year})  {score:.0%}" if year else f"{name}  {score:.0%}"
-            for _, name, year, score in matches_list
-        ]
+        if not row_data_list or content_type.get() == 'movie':
+            return
+        matches_list = row_data_list[0].get('series_matches', [])
+        choices = _match_choices(matches_list)
         val = series_combo.get()
         if val not in choices:
             return
         new_idx = choices.index(val)
-        if not row_data_list or new_idx == row_data_list[0].get('selected_series_idx', 0):
+        if new_idx == row_data_list[0].get('selected_series_idx', 0):
             return
-        status_var.set("Re-looking up with new series...")
+        status_var.set("Re-looking up with new match...")
         popup.update_idletasks()
         for r in row_data_list:
             _recompute_series_for_row(r, new_idx)
@@ -1037,6 +1298,27 @@ def build_tvdb_popup(parent, filepaths, apply_callback):
         _update_status()
 
     series_combo.bind('<<ComboboxSelected>>', _on_series_selected)
+
+    def _on_type_changed():
+        """Show/hide TV-only controls and re-run the lookup in the new mode."""
+        if content_type.get() == 'movie':
+            tv_only_frame.pack_forget()
+            # Movies get a per-row dropdown; hide the top-bar match combo.
+            match_sep.pack_forget()
+            match_label.pack_forget()
+            series_combo.pack_forget()
+        else:
+            # Re-insert tv_only_frame and the match combo in their original
+            # slots (just before their trailing siblings in ctrl_frame).
+            tv_only_frame.pack(side=tk.LEFT, before=match_sep)
+            match_sep.pack(side=tk.LEFT, fill=tk.Y, padx=(12, 12), pady=2)
+            match_label.pack(side=tk.LEFT, padx=(0, 4))
+            series_combo.pack(side=tk.LEFT)
+            match_label.configure(text="Series:")
+        _lookup_all()
+
+    type_tv_btn.configure(command=_on_type_changed)
+    type_movie_btn.configure(command=_on_type_changed)
 
     # ── Layout: Bottom Bar ───────────────────────────────────────
     bottom_frame = tk.Frame(popup, bg=_BG)
