@@ -45,7 +45,7 @@ COMSKIP_INI     = os.path.join(_PROJECT_ROOT, 'comskip_dst', 'comskip.ini')
 # Single source of truth for per-file wall-clock limit.  The watchdog below
 # kills both the Comskip subprocess and the VideoReDo COM process if a worker
 # exceeds this; no other timeouts exist anywhere in the pipeline.
-FILE_TIMEOUT = 900   # 15 minutes
+FILE_TIMEOUT = 1800   # 30 minutes
 
 # Comskip writes in-place progress updates like:
 #   "00:01:23 -  1234 frames, 42%"
