@@ -30,7 +30,7 @@ from batch_vrd_save import (
     _HAS_SEND2TRASH,
     console, _log, _build_table, _set_slot, _upd_slot, _del_slot,
     _fmt_bytes, _fmt_elapsed,
-    find_videos, save_vrd,
+    find_videos, save_vrd, update_tally,
     VIDEO_EXTS, NO_ADS_SUFFIX,
 )
 from rich.live import Live
@@ -38,7 +38,7 @@ from rich.live import Live
 _PROJECT_ROOT   = os.path.dirname(os.path.abspath(__file__))
 COMSKIP_EXE     = os.path.join(_PROJECT_ROOT, 'comskip_dst', 'comskip.exe')
 COMSKIP_INI     = os.path.join(_PROJECT_ROOT, 'comskip_dst', 'comskip.ini')
-COMSKIP_TIMEOUT = 3600  # 1h per file
+FILE_TIMEOUT    = 3600  # 1h wall-clock limit per file (comskip + vrd save combined)
 
 # Comskip writes several sidecar files alongside its output.
 _COMSKIP_SIDECAR_EXTS = ('.VPrj', '.edl', '.log', '.logo.txt', '.txt')
@@ -50,13 +50,14 @@ _COMSKIP_PROGRESS_RE = re.compile(
     r'(\d+:\d\d:\d\d)\s*-\s*(\d+)\s+frames.*?(\d+)%\s*$'
 )
 
-# Register a style for the Comskip phase on the shared dashboard.
-bvs._PHASE_STYLE['Comskip'] = 'magenta'
+# Register styles for phases on the shared dashboard.
+bvs._PHASE_STYLE['Comskip']   = 'magenta'
+bvs._PHASE_STYLE['Timed out'] = 'bold yellow'
 
 
 def _run_comskip(src: str, out_dir: str, out_stem: str,
                  comskip_exe: str, comskip_ini: str,
-                 status_fn) -> str | None:
+                 status_fn, *, deadline: float) -> str | None:
     """
     Run Comskip on `src`, writing outputs into `out_dir` with basename
     `out_stem`.  Returns the path to the produced .VPrj on success, else None.
@@ -94,7 +95,6 @@ def _run_comskip(src: str, out_dir: str, out_stem: str,
         **popen_kwargs,
     )
     assert proc.stdout is not None
-    deadline = time.monotonic() + COMSKIP_TIMEOUT
     buf = ''
     try:
         while True:
@@ -137,7 +137,7 @@ def _cleanup_comskip_outputs(out_dir: str, out_stem: str) -> None:
 
 def process_file(vrd, path: str, recycle: bool,
                  comskip_exe: str, comskip_ini: str,
-                 *, status_fn) -> tuple:
+                 *, status_fn, deadline: float) -> tuple:
     """
     Run Comskip on `path`, then hand its Vprj to VRD for the cut-and-save.
     Returns (success, orig_bytes, new_bytes, n_cuts, err_msg).
@@ -148,14 +148,18 @@ def process_file(vrd, path: str, recycle: bool,
 
     vprj = _run_comskip(
         path, out_dir, out_stem, comskip_exe, comskip_ini, status_fn,
+        deadline=deadline,
     )
     if vprj is None:
         _cleanup_comskip_outputs(out_dir, out_stem)
         status_fn(phase='Error')
+        if time.monotonic() >= deadline:
+            return False, 0, 0, 0, 'Timed out (1h limit exceeded)'
         return False, 0, 0, 0, 'Comskip failed to produce a .VPrj'
 
     try:
-        return save_vrd(vrd, path, vprj, recycle=recycle, status_fn=status_fn)
+        return save_vrd(vrd, path, vprj, recycle=recycle, status_fn=status_fn,
+                        deadline=deadline)
     finally:
         _cleanup_comskip_outputs(out_dir, out_stem)
 
@@ -170,6 +174,7 @@ def _worker(task: tuple) -> tuple:
         _upd_slot(idx, **kw)
 
     t0 = time.monotonic()
+    file_deadline = t0 + FILE_TIMEOUT
     import pythoncom
     pythoncom.CoInitialize()
     vrd_silent = vrd = None
@@ -180,6 +185,7 @@ def _worker(task: tuple) -> tuple:
         success, orig_b, new_b, n_cuts, err_msg = process_file(
             vrd, path, recycle, comskip_exe, comskip_ini,
             status_fn=status_fn,
+            deadline=file_deadline,
         )
         elapsed = _fmt_elapsed(time.monotonic() - t0)
         cuts_str = (f'  [bright_white]{n_cuts} cut{"s" if n_cuts != 1 else ""}[/bright_white]'
@@ -276,6 +282,8 @@ def main():
                         help=f'Path to comskip.exe (default: {COMSKIP_EXE})')
     parser.add_argument('--comskip-ini', default=COMSKIP_INI,
                         help=f'Path to comskip.ini (default: {COMSKIP_INI})')
+    parser.add_argument('--start-at', type=int, default=1, metavar='N',
+                        help='Skip the first N-1 files and start at file number N (1-based, default: 1)')
     args = parser.parse_args()
 
     try:
@@ -327,9 +335,18 @@ def main():
         console.print('No video files found.')
         return
 
-    n_workers = min(args.threads, total)
+    start_idx = max(1, args.start_at)
+    if start_idx > 1:
+        if start_idx > total:
+            console.print(f'ERROR: --start-at {start_idx} exceeds total file count ({total}).', style='red')
+            sys.exit(1)
+        videos = videos[start_idx - 1:]
+
+    n_workers = min(args.threads, len(videos))
     console.rule('[bold]Comskip + VideoReDo Batch[/bold]')
     console.print(f'  Found    [cyan]{total}[/cyan] video file(s) in [dim]{source_desc!r}[/dim]')
+    if start_idx > 1:
+        console.print(f'  Starting at file [cyan]{start_idx}[/cyan] ([dim]{total - len(videos)} skipped[/dim])')
     console.print(f'  Comskip  [cyan]{args.comskip}[/cyan]')
     console.print(f'  Workers  [cyan]{n_workers}[/cyan]')
     if args.recycle:
@@ -337,7 +354,7 @@ def main():
     console.print()
 
     tasks = [
-        (i + 1, total, p, args.recycle, args.comskip, args.comskip_ini)
+        (start_idx + i, total, p, args.recycle, args.comskip, args.comskip_ini)
         for i, p in enumerate(videos)
     ]
 
@@ -368,6 +385,7 @@ def main():
                             processed += 1
                             total_orig_bytes += orig_b
                             total_new_bytes  += new_b
+                            update_tally(orig_b, new_b)
                         else:
                             if orig_b == 0:
                                 errors += 1

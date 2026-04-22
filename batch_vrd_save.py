@@ -48,7 +48,7 @@ OUTPUT_SCANNING = 2
 OUTPUT_PAUSED   = 3
 
 SAVE_POLL_INTERVAL = 2.0    # seconds between save-complete polls
-SAVE_TIMEOUT       = 14400  # 4 h max for a single save
+SAVE_TIMEOUT       = 1800    # 1 /2 h max for a single save
 LOAD_TIMEOUT       = 60     # seconds to wait for a project to load
 
 _stop_event = threading.Event()
@@ -61,6 +61,17 @@ console = Console(highlight=False)
 
 _slots_lock = threading.Lock()
 _slots: dict = {}  # idx -> {idx, total, fname, phase, pct, cuts, start}
+
+_tally_lock = threading.Lock()
+_tally: dict = {'saved': 0, 'orig': 0, 'processed': 0}  # running totals
+
+
+def update_tally(orig_bytes: int, new_bytes: int) -> None:
+    """Accumulate bytes from a completed file into the running tally."""
+    with _tally_lock:
+        _tally['orig']      += orig_bytes
+        _tally['saved']     += orig_bytes - new_bytes
+        _tally['processed'] += 1
 
 
 def _set_slot(idx: int, **kw) -> None:
@@ -80,10 +91,11 @@ def _del_slot(idx: int) -> None:
 
 
 _PHASE_STYLE = {
-    'Loading':  'cyan',
-    'Saving':   'bright_cyan',
-    'No ads':   'dim',
-    'Error':    'bold red',
+    'Loading':   'cyan',
+    'Saving':    'bright_cyan',
+    'No ads':    'dim',
+    'Error':     'bold red',
+    'Timed out': 'bold yellow',
 }
 
 
@@ -96,6 +108,10 @@ def _fmt_elapsed(secs: float) -> str:
 def _build_table() -> Panel:
     with _slots_lock:
         rows = sorted(_slots.items())
+    with _tally_lock:
+        tally_saved     = _tally['saved']
+        tally_orig      = _tally['orig']
+        tally_processed = _tally['processed']
     table = Table(
         show_header=True, header_style='bold dim',
         box=rich_box.SIMPLE_HEAD, expand=True,
@@ -118,9 +134,17 @@ def _build_table() -> Panel:
             _fmt_elapsed(elapsed),
         )
     n = len(rows)
+    if tally_processed > 0 and tally_orig > 0:
+        pct = tally_saved / tally_orig * 100
+        tally_str = (
+            f'  [dim]saved [/dim][green]{_fmt_bytes(tally_saved)}[/green]'
+            f'[dim] / {tally_processed} done ({pct:.0f}%)[/dim]'
+        )
+    else:
+        tally_str = ''
     return Panel(
         table,
-        title=f'[bold]Batch[/bold]  [dim]{n} active[/dim]',
+        title=f'[bold]Batch[/bold]  [dim]{n} active[/dim]{tally_str}',
         border_style='bright_blue',
         padding=(0, 1),
     )
@@ -178,13 +202,12 @@ def _wait_for(check_fn, timeout: float, interval: float,
     return False
 
 
-def _open_and_wait(vrd, path: str, status_fn) -> bool:
+def _open_and_wait(vrd, path: str, status_fn, *, timeout: float = LOAD_TIMEOUT) -> bool:
     """FileOpen + wait for NavigationGetState != 0. Returns True on success."""
     if not bool(vrd.FileOpen(path, False)):
         status_fn(phase='Error')
         return False
-    if not _wait_for(lambda: int(vrd.NavigationGetState) != 0,
-                     LOAD_TIMEOUT, 0.5):
+    if not _wait_for(lambda: int(vrd.NavigationGetState) != 0, timeout, 0.5):
         status_fn(phase='Error')
         vrd.FileClose()
         return False
@@ -196,7 +219,7 @@ def _open_and_wait(vrd, path: str, status_fn) -> bool:
 # ---------------------------------------------------------------------------
 
 def save_vrd(vrd, source_path: str, vprj_path: str, *,
-             recycle: bool, status_fn) -> tuple:
+             recycle: bool, status_fn, deadline: float | None = None) -> tuple:
     """
     Open `vprj_path` in VRD and smart-render the source minus its cut regions.
 
@@ -214,8 +237,9 @@ def save_vrd(vrd, source_path: str, vprj_path: str, *,
     temp_output = stem + '_no_ads.mkv'
     orig_size   = os.path.getsize(source_path)
 
+    load_timeout = max(5.0, deadline - time.monotonic()) if deadline else LOAD_TIMEOUT
     status_fn(phase='Loading')
-    if not _open_and_wait(vrd, vprj_path, status_fn):
+    if not _open_and_wait(vrd, vprj_path, status_fn, timeout=load_timeout):
         return False, 0, 0, 0, 'Failed to open project file'
 
     n_cuts = int(vrd.EditGetEditsListCount)
@@ -241,16 +265,19 @@ def save_vrd(vrd, source_path: str, vprj_path: str, *,
             pct = 0.0
         status_fn(phase='Saving', pct=pct, cuts=n_cuts)
 
+    save_timeout = max(0.0, deadline - time.monotonic()) if deadline else SAVE_TIMEOUT
     save_done = _wait_for(
         lambda: int(vrd.OutputGetState) == OUTPUT_NONE,
-        SAVE_TIMEOUT, SAVE_POLL_INTERVAL, _save_tick,
+        save_timeout, SAVE_POLL_INTERVAL, _save_tick,
     )
 
     vrd.FileClose()
 
     if not save_done:
-        status_fn(phase='Error')
-        return False, 0, 0, n_cuts, 'Save timed out'
+        timed_out = deadline is not None and time.monotonic() >= deadline
+        status_fn(phase='Timed out' if timed_out else 'Error')
+        err = 'Timed out (1h limit exceeded)' if timed_out else 'Save timed out'
+        return False, 0, 0, n_cuts, err
 
     if not os.path.isfile(temp_output) or os.path.getsize(temp_output) == 0:
         status_fn(phase='Error')
