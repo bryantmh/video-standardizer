@@ -18,10 +18,13 @@ Usage:
 """
 
 import argparse
+import csv
+import io
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait as _fut_wait, FIRST_COMPLETED
 
@@ -38,10 +41,11 @@ from rich.live import Live
 _PROJECT_ROOT   = os.path.dirname(os.path.abspath(__file__))
 COMSKIP_EXE     = os.path.join(_PROJECT_ROOT, 'comskip_dst', 'comskip.exe')
 COMSKIP_INI     = os.path.join(_PROJECT_ROOT, 'comskip_dst', 'comskip.ini')
-FILE_TIMEOUT    = 3600  # 1h wall-clock limit per file (comskip + vrd save combined)
 
-# Comskip writes several sidecar files alongside its output.
-_COMSKIP_SIDECAR_EXTS = ('.VPrj', '.edl', '.log', '.logo.txt', '.txt')
+# Single source of truth for per-file wall-clock limit.  The watchdog below
+# kills both the Comskip subprocess and the VideoReDo COM process if a worker
+# exceeds this; no other timeouts exist anywhere in the pipeline.
+FILE_TIMEOUT = 900   # 15 minutes
 
 # Comskip writes in-place progress updates like:
 #   "00:01:23 -  1234 frames, 42%"
@@ -55,9 +59,219 @@ bvs._PHASE_STYLE['Comskip']   = 'magenta'
 bvs._PHASE_STYLE['Timed out'] = 'bold yellow'
 
 
+# ---------------------------------------------------------------------------
+#  Timeout registry + single watchdog thread
+#
+#  Each worker registers its deadline and the child processes that should be
+#  forcibly terminated if that deadline is exceeded.  A single background
+#  thread walks the registry every second and kills any expired worker's
+#  processes.  This is the ONLY timeout mechanism in the whole pipeline.
+#
+#  Replaces an earlier per-worker threading.Timer + PID-diff design that was
+#  racy: two workers Dispatching at the same time both computed "new VRD PIDs
+#  since my snapshot" and targeted the same PID, so only one of several stuck
+#  workers actually got killed.
+# ---------------------------------------------------------------------------
+
+_timeouts_lock = threading.Lock()
+# idx -> {
+#   'deadline':     monotonic time this slot must finish by,
+#   'comskip_proc': live subprocess.Popen for Comskip (or None),
+#   'vrd_pid':      OS PID of this worker's VideoReDo instance (or None),
+#   'source_path':  input video path (used only for log messages),
+#   'out_dir':      directory where Comskip sidecars + _no_ads output live,
+#   'out_stem':     Comskip sidecar basename (src-stem + '_comskip'),
+#   'temp_output':  partial '<src-stem>_no_ads.mkv' to clean on timeout,
+#   'expired':      True once the watchdog has fired on this slot.
+# }
+_timeouts: dict = {}
+
+# Serializes Dispatch+PID-probe across workers so each observes a distinct new
+# VRD PID.  Short contention, but prior races left timeouts targeting the
+# wrong process (or no process at all).
+_vrd_dispatch_lock = threading.Lock()
+
+_watchdog_stop = threading.Event()
+_watchdog_thread: threading.Thread | None = None
+
+_COMSKIP_SIDECAR_EXTS = ('.VPrj', '.edl', '.log', '.logo.txt', '.txt')
+
+
+def _register_timeout(idx: int, deadline: float, *,
+                      source_path: str, out_dir: str, out_stem: str,
+                      temp_output: str) -> None:
+    with _timeouts_lock:
+        _timeouts[idx] = {
+            'deadline':     deadline,
+            'comskip_proc': None,
+            'vrd_pid':      None,
+            'source_path':  source_path,
+            'out_dir':      out_dir,
+            'out_stem':     out_stem,
+            'temp_output':  temp_output,
+            'expired':      False,
+        }
+
+
+def _attach_comskip(idx: int, proc) -> None:
+    with _timeouts_lock:
+        entry = _timeouts.get(idx)
+        if entry is not None:
+            entry['comskip_proc'] = proc
+
+
+def _attach_vrd_pid(idx: int, pid: int | None) -> None:
+    with _timeouts_lock:
+        entry = _timeouts.get(idx)
+        if entry is not None:
+            entry['vrd_pid'] = pid
+
+
+def _is_expired(idx: int) -> bool:
+    with _timeouts_lock:
+        entry = _timeouts.get(idx)
+        return bool(entry and entry['expired'])
+
+
+def _unregister_timeout(idx: int) -> None:
+    with _timeouts_lock:
+        _timeouts.pop(idx, None)
+
+
+def _kill_process_tree(pid: int) -> None:
+    """Force-kill a process and all descendants via taskkill /F /T."""
+    if not pid:
+        return
+    try:
+        subprocess.run(
+            ['taskkill', '/F', '/T', '/PID', str(pid)],
+            capture_output=True, timeout=10,
+        )
+    except Exception:
+        pass
+
+
+def _cleanup_slot(entry: dict) -> None:
+    """Delete the partial _no_ads output and all Comskip sidecars for a slot.
+
+    Only touches files tied to this specific source — never the original
+    input, never other workers' outputs.
+    """
+    temp_output = entry.get('temp_output')
+    if temp_output:
+        try:
+            if os.path.isfile(temp_output):
+                os.remove(temp_output)
+        except Exception:
+            pass
+    out_dir  = entry.get('out_dir')
+    out_stem = entry.get('out_stem')
+    if out_dir and out_stem:
+        for ext in _COMSKIP_SIDECAR_EXTS:
+            p = os.path.join(out_dir, out_stem + ext)
+            try:
+                if os.path.isfile(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
+
+def _terminate_slot(entry: dict) -> None:
+    """Kill the processes registered for one slot and delete its partial
+    outputs.  Used by both the timeout watchdog and the Ctrl-C handler.
+    """
+    proc = entry.get('comskip_proc')
+    if proc is not None:
+        _kill_process_tree(proc.pid)
+    vrd_pid = entry.get('vrd_pid')
+    if vrd_pid:
+        _kill_process_tree(vrd_pid)
+    # Give the OS a moment to release file handles before deleting.
+    time.sleep(0.5)
+    _cleanup_slot(entry)
+
+
+def _expire_all_slots(reason: str) -> None:
+    """Mark every registered slot expired and terminate it.  Called on
+    Ctrl-C so any partial output is cleaned up before we exit.
+    """
+    with _timeouts_lock:
+        victims: list[dict] = []
+        for entry in _timeouts.values():
+            if entry['expired']:
+                continue
+            entry['expired'] = True
+            victims.append(dict(entry))
+    for entry in victims:
+        src = entry.get('source_path', '?')
+        _log(f'[yellow]  {reason}: cleaning up {os.path.basename(src)}[/yellow]')
+        _terminate_slot(entry)
+
+
+def _watchdog_loop() -> None:
+    """Every second: for each slot past its deadline, kill its processes
+    (Comskip + that worker's VRD), then clean up partial output files.  Only
+    touches the processes and files tied to the expired slot.
+    """
+    while not _watchdog_stop.is_set():
+        now = time.monotonic()
+        victims: list[dict] = []
+        with _timeouts_lock:
+            for entry in _timeouts.values():
+                if entry['expired']:
+                    continue
+                if now >= entry['deadline']:
+                    entry['expired'] = True
+                    # Copy so we can act outside the lock even if the worker's
+                    # finally removes the entry in the meantime.
+                    victims.append(dict(entry))
+        # Kill + clean outside the lock so a slow taskkill can't block new
+        # registrations from other workers.
+        for entry in victims:
+            # src = entry.get('source_path', '?')
+            # _log(f'[yellow]  TIMEOUT: {os.path.basename(src)} exceeded {FILE_TIMEOUT}s — killing processes[/yellow]')
+            _terminate_slot(entry)
+        _watchdog_stop.wait(1.0)
+
+
+def _start_watchdog() -> None:
+    """Launch the singleton watchdog thread.  Idempotent."""
+    global _watchdog_thread
+    if _watchdog_thread is not None and _watchdog_thread.is_alive():
+        return
+    _watchdog_stop.clear()
+    _watchdog_thread = threading.Thread(
+        target=_watchdog_loop, name='timeout-watchdog', daemon=True,
+    )
+    _watchdog_thread.start()
+
+
+def _stop_watchdog() -> None:
+    _watchdog_stop.set()
+
+
+def _find_vrd_pids() -> set[int]:
+    """Return PIDs of currently running VideoReDo processes via tasklist."""
+    try:
+        out = subprocess.check_output(
+            ['tasklist', '/FO', 'CSV', '/NH'],
+            text=True, timeout=10, stderr=subprocess.DEVNULL,
+        )
+        pids = set()
+        for row in csv.reader(io.StringIO(out)):
+            if len(row) >= 2 and 'videoredo' in row[0].lower():
+                try:
+                    pids.add(int(row[1]))
+                except ValueError:
+                    pass
+        return pids
+    except Exception:
+        return set()
+
+
 def _run_comskip(src: str, out_dir: str, out_stem: str,
                  comskip_exe: str, comskip_ini: str,
-                 status_fn, *, deadline: float) -> str | None:
+                 status_fn, *, idx: int) -> str | None:
     """
     Run Comskip on `src`, writing outputs into `out_dir` with basename
     `out_stem`.  Returns the path to the produced .VPrj on success, else None.
@@ -95,15 +309,16 @@ def _run_comskip(src: str, out_dir: str, out_stem: str,
         **popen_kwargs,
     )
     assert proc.stdout is not None
+    # Hand the Popen to the watchdog so it can kill the whole tree on timeout.
+    _attach_comskip(idx, proc)
     buf = ''
     try:
         while True:
             chunk = proc.stdout.read(256)
             if not chunk:
+                # Pipe closed — either Comskip exited normally, or the
+                # watchdog killed it.  Either way, stop reading.
                 break
-            if time.monotonic() > deadline:
-                proc.kill()
-                return None
             buf += chunk.replace('\r', '\n')
             while '\n' in buf:
                 line, buf = buf.split('\n', 1)
@@ -119,13 +334,24 @@ def _run_comskip(src: str, out_dir: str, out_stem: str,
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            # Belt-and-braces: the watchdog should have killed it, but if the
+            # pipe closed for some other reason, make sure the tree is gone.
+            _kill_process_tree(proc.pid)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+    if _is_expired(idx):
+        return None
 
     vprj = os.path.join(out_dir, out_stem + '.VPrj')
     return vprj if os.path.isfile(vprj) else None
 
 
-def _cleanup_comskip_outputs(out_dir: str, out_stem: str) -> None:
+def _cleanup_sidecars(out_dir: str, out_stem: str) -> None:
+    """Remove Comskip sidecar files (.VPrj, .edl, .log, etc.) after a
+    successful save.  On timeout the watchdog performs this cleanup itself."""
     for ext in _COMSKIP_SIDECAR_EXTS:
         p = os.path.join(out_dir, out_stem + ext)
         try:
@@ -137,31 +363,31 @@ def _cleanup_comskip_outputs(out_dir: str, out_stem: str) -> None:
 
 def process_file(vrd, path: str, recycle: bool,
                  comskip_exe: str, comskip_ini: str,
-                 *, status_fn, deadline: float) -> tuple:
+                 *, status_fn, idx: int, out_dir: str, out_stem: str) -> tuple:
     """
     Run Comskip on `path`, then hand its Vprj to VRD for the cut-and-save.
     Returns (success, orig_bytes, new_bytes, n_cuts, err_msg).
     """
-    stem, _ext = os.path.splitext(path)
-    out_dir    = os.path.dirname(path)
-    out_stem   = os.path.basename(stem) + '_comskip'
-
     vprj = _run_comskip(
         path, out_dir, out_stem, comskip_exe, comskip_ini, status_fn,
-        deadline=deadline,
+        idx=idx,
     )
     if vprj is None:
-        _cleanup_comskip_outputs(out_dir, out_stem)
+        if _is_expired(idx):
+            status_fn(phase='Timed out')
+            return False, 0, 0, 0, 'Timed out (limit exceeded)'
+        _cleanup_sidecars(out_dir, out_stem)
         status_fn(phase='Error')
-        if time.monotonic() >= deadline:
-            return False, 0, 0, 0, 'Timed out (1h limit exceeded)'
         return False, 0, 0, 0, 'Comskip failed to produce a .VPrj'
 
     try:
-        return save_vrd(vrd, path, vprj, recycle=recycle, status_fn=status_fn,
-                        deadline=deadline)
+        return save_vrd(vrd, path, vprj, recycle=recycle, status_fn=status_fn)
     finally:
-        _cleanup_comskip_outputs(out_dir, out_stem)
+        # On success this tidies sidecars.  On timeout the watchdog has
+        # already cleaned everything (including any partial _no_ads output),
+        # so a duplicate best-effort pass here is harmless.
+        if not _is_expired(idx):
+            _cleanup_sidecars(out_dir, out_stem)
 
 
 def _worker(task: tuple) -> tuple:
@@ -173,19 +399,51 @@ def _worker(task: tuple) -> tuple:
     def status_fn(**kw):
         _upd_slot(idx, **kw)
 
+    stem, _ext  = os.path.splitext(path)
+    out_dir     = os.path.dirname(path)
+    out_stem    = os.path.basename(stem) + '_comskip'
+    temp_output = stem + '_no_ads.mkv'
+
     t0 = time.monotonic()
-    file_deadline = t0 + FILE_TIMEOUT
+    _register_timeout(
+        idx, t0 + FILE_TIMEOUT,
+        source_path=path, out_dir=out_dir, out_stem=out_stem,
+        temp_output=temp_output,
+    )
+
     import pythoncom
     pythoncom.CoInitialize()
     vrd_silent = vrd = None
+    vrd_pid: int | None = None
     try:
         import win32com.client
-        vrd_silent = win32com.client.Dispatch('VideoReDo6.VideoReDoSilent')
-        vrd = vrd_silent.VRDInterface
+
+        # Serialize Dispatch + PID probe across all workers.  Without this,
+        # two workers that snapshot "pids_before" at the same instant both
+        # see each other's new PIDs and race to target the same process —
+        # only one of several stuck workers actually gets killed on timeout.
+        with _vrd_dispatch_lock:
+            pids_before = _find_vrd_pids()
+            vrd_silent = win32com.client.Dispatch('VideoReDo6.VideoReDoSilent')
+            vrd = vrd_silent.VRDInterface
+            # VRD may take a moment to appear in the process list after Dispatch.
+            probe_deadline = time.monotonic() + 6
+            while time.monotonic() < probe_deadline:
+                new_pids = _find_vrd_pids() - pids_before
+                if new_pids:
+                    vrd_pid = next(iter(new_pids))
+                    break
+                time.sleep(0.25)
+
+        if vrd_pid is None:
+            _log(f'[yellow]  WARNING: {fname}: could not determine VRD PID — timeout kill will not work[/yellow]')
+        else:
+            _attach_vrd_pid(idx, vrd_pid)
+
         success, orig_b, new_b, n_cuts, err_msg = process_file(
             vrd, path, recycle, comskip_exe, comskip_ini,
-            status_fn=status_fn,
-            deadline=file_deadline,
+            status_fn=status_fn, idx=idx,
+            out_dir=out_dir, out_stem=out_stem,
         )
         elapsed = _fmt_elapsed(time.monotonic() - t0)
         cuts_str = (f'  [bright_white]{n_cuts} cut{"s" if n_cuts != 1 else ""}[/bright_white]'
@@ -213,18 +471,32 @@ def _worker(task: tuple) -> tuple:
         return path, success, orig_b, new_b
     except Exception as exc:
         elapsed = _fmt_elapsed(time.monotonic() - t0)
+        # If the watchdog already fired, the exception is almost certainly a
+        # COM failure caused by VRD being killed — report it as a timeout.
+        if _is_expired(idx):
+            label = 'Timed out (limit exceeded)'
+            status_fn(phase='Timed out')
+        else:
+            label = str(exc)
+            status_fn(phase='Error')
         _log(
             f'[bold red]✗[/bold red] [dim]{idx}/{total}[/dim]'
-            f'  {fname}  [red]{exc}[/red]  [dim]{elapsed}[/dim]'
+            f'  {fname}  [red]{label}[/red]  [dim]{elapsed}[/dim]'
         )
         return path, False, 0, 0
     finally:
+        _unregister_timeout(idx)
         _del_slot(idx)
+        # Clean shutdown of our VRD instance.  If ProgramExit blocks (e.g.
+        # because the watchdog already killed VRD), we fall through to the
+        # taskkill below.  Either way, don't leave an orphan VRD process.
         if vrd is not None:
             try:
                 vrd.ProgramExit()
             except Exception:
                 pass
+        if vrd_pid is not None:
+            _kill_process_tree(vrd_pid)
         try:
             pythoncom.CoUninitialize()
         except Exception:
@@ -272,8 +544,8 @@ def main():
     parser.add_argument('directory', nargs='?', default=None,
                         help='Root folder of videos to process, or "-" to '
                              'read newline-separated file paths from stdin')
-    parser.add_argument('--threads', type=int, default=8,
-                        help='Parallel worker count (default: 8).  Each worker '
+    parser.add_argument('--threads', type=int, default=10,
+                        help='Parallel worker count (default: 10).  Each worker '
                              'runs Comskip and a VideoReDo instance in sequence.')
     parser.add_argument('--recycle', action='store_true',
                         help='Send the original to the recycle bin and rename '
@@ -361,6 +633,7 @@ def main():
     processed = skipped = errors = 0
     total_orig_bytes = total_new_bytes = 0
 
+    _start_watchdog()
     try:
         with Live(_build_table(), console=console, refresh_per_second=4,
                   vertical_overflow='visible') as live:
@@ -394,7 +667,10 @@ def main():
                 live.update(_build_table())
     except KeyboardInterrupt:
         bvs._stop_event.set()
-        _log('\n[yellow]Stopping... waiting for active workers to finish.[/yellow]')
+        _log('\n[yellow]Ctrl-C received — killing active workers and cleaning up partial output...[/yellow]')
+        _expire_all_slots('INTERRUPTED')
+    finally:
+        _stop_watchdog()
 
     console.print()
     console.rule()

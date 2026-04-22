@@ -2,15 +2,11 @@
 """
 batch_vrd_save.py — Shared VideoReDo save + batch-dashboard library.
 
-Not a standalone entry point.  batch_comskip.py is the caller.
-
-Exposes:
-  - Live dashboard primitives (console, _log, _build_table, _set_slot,
-    _upd_slot, _del_slot, _PHASE_STYLE)
-  - Video discovery + formatting helpers (find_videos, _fmt_bytes,
-    _fmt_elapsed, _wait_for)
-  - save_vrd(): given a Vprj produced elsewhere (e.g. by Comskip), open it
-    in VRD and smart-render the source minus the cut regions.
+Not a standalone entry point.  batch_comskip.py is the caller and owns ALL
+timeout/watchdog logic.  This module has no deadlines, no expiry flags, no
+knowledge that timeouts exist.  Its polling loops run forever; when the
+caller's watchdog kills the VRD process, the next COM call raises and the
+exception propagates up for the caller to handle.
 """
 
 import os
@@ -48,8 +44,6 @@ OUTPUT_SCANNING = 2
 OUTPUT_PAUSED   = 3
 
 SAVE_POLL_INTERVAL = 2.0    # seconds between save-complete polls
-SAVE_TIMEOUT       = 1800    # 1 /2 h max for a single save
-LOAD_TIMEOUT       = 60     # seconds to wait for a project to load
 
 _stop_event = threading.Event()
 
@@ -181,36 +175,28 @@ def find_videos(root: str) -> list[str]:
     return sorted(paths)
 
 
-def _wait_for(check_fn, timeout: float, interval: float,
-              progress_fn=None) -> bool:
-    """Poll check_fn() until True or timeout. Returns True on success."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if _stop_event.is_set():
-            return False
-        try:
-            if check_fn():
-                return True
-        except Exception:
-            pass
+def _wait_for(check_fn, interval: float, *, progress_fn=None) -> None:
+    """Poll check_fn() until it returns True.  No timeout — the caller's
+    watchdog is what stops us, by killing VRD; the next COM call then raises
+    and that exception propagates out of here for the caller to catch.
+    """
+    while not _stop_event.is_set():
+        if check_fn():
+            return
         if progress_fn:
             try:
                 progress_fn()
             except Exception:
                 pass
         time.sleep(interval)
-    return False
 
 
-def _open_and_wait(vrd, path: str, status_fn, *, timeout: float = LOAD_TIMEOUT) -> bool:
+def _open_and_wait(vrd, path: str, status_fn) -> bool:
     """FileOpen + wait for NavigationGetState != 0. Returns True on success."""
     if not bool(vrd.FileOpen(path, False)):
         status_fn(phase='Error')
         return False
-    if not _wait_for(lambda: int(vrd.NavigationGetState) != 0, timeout, 0.5):
-        status_fn(phase='Error')
-        vrd.FileClose()
-        return False
+    _wait_for(lambda: int(vrd.NavigationGetState) != 0, 0.5)
     return True
 
 
@@ -219,7 +205,7 @@ def _open_and_wait(vrd, path: str, status_fn, *, timeout: float = LOAD_TIMEOUT) 
 # ---------------------------------------------------------------------------
 
 def save_vrd(vrd, source_path: str, vprj_path: str, *,
-             recycle: bool, status_fn, deadline: float | None = None) -> tuple:
+             recycle: bool, status_fn) -> tuple:
     """
     Open `vprj_path` in VRD and smart-render the source minus its cut regions.
 
@@ -227,6 +213,10 @@ def save_vrd(vrd, source_path: str, vprj_path: str, *,
     detector (e.g. Comskip).  Output is written next to the source as
     `<stem>_no_ads.mkv`.  With recycle=True the original is sent to the
     recycle bin and the output is renamed into its place (as `.mkv`).
+
+    No timeouts here — this function polls forever.  When the caller's
+    watchdog kills VRD, the next COM call raises; the exception propagates
+    out and the caller is responsible for interpreting + cleaning up.
 
     Returns (success, orig_bytes, new_bytes, n_cuts, err_msg):
       success=True               -> err_msg is None
@@ -237,9 +227,8 @@ def save_vrd(vrd, source_path: str, vprj_path: str, *,
     temp_output = stem + '_no_ads.mkv'
     orig_size   = os.path.getsize(source_path)
 
-    load_timeout = max(5.0, deadline - time.monotonic()) if deadline else LOAD_TIMEOUT
     status_fn(phase='Loading')
-    if not _open_and_wait(vrd, vprj_path, status_fn, timeout=load_timeout):
+    if not _open_and_wait(vrd, vprj_path, status_fn):
         return False, 0, 0, 0, 'Failed to open project file'
 
     n_cuts = int(vrd.EditGetEditsListCount)
@@ -265,19 +254,12 @@ def save_vrd(vrd, source_path: str, vprj_path: str, *,
             pct = 0.0
         status_fn(phase='Saving', pct=pct, cuts=n_cuts)
 
-    save_timeout = max(0.0, deadline - time.monotonic()) if deadline else SAVE_TIMEOUT
-    save_done = _wait_for(
+    _wait_for(
         lambda: int(vrd.OutputGetState) == OUTPUT_NONE,
-        save_timeout, SAVE_POLL_INTERVAL, _save_tick,
+        SAVE_POLL_INTERVAL, progress_fn=_save_tick,
     )
 
     vrd.FileClose()
-
-    if not save_done:
-        timed_out = deadline is not None and time.monotonic() >= deadline
-        status_fn(phase='Timed out' if timed_out else 'Error')
-        err = 'Timed out (1h limit exceeded)' if timed_out else 'Save timed out'
-        return False, 0, 0, n_cuts, err
 
     if not os.path.isfile(temp_output) or os.path.getsize(temp_output) == 0:
         status_fn(phase='Error')
