@@ -132,10 +132,11 @@ def _clean_title(raw):
     """Convert a messy filename fragment to a clean title for matching.
 
     Handles: periods as spaces, trailing garbage (codec, resolution, group tags),
-    square-bracket metadata, and release group names.
+    square-bracket metadata, and release group names. Callers are expected to
+    strip the file extension themselves — we can't do it safely here because
+    a trailing ".Eyes" or ".Way" in a title fragment is indistinguishable from
+    a short extension.
     """
-    # Remove file extension if present
-    raw = re.sub(r'\.\w{2,4}$', '', raw)
     # Remove square-bracket tags like [SD 1Mbps MPEG4], [HD 10Mbps HEVC], etc.
     raw = re.sub(r'\[.*?\]', '', raw)
     # Remove parenthesized year/quality tags like (2009), (1080p)
@@ -270,23 +271,33 @@ def get_series_episodes(series_id, season_type='default', page=0):
     
     Fetches all pages automatically.
     """
-    cache_key = f'/series/{series_id}/episodes/{season_type}?page=all'
+    # v2: previous cache builder had a pagination bug that could truncate
+    # long episode lists. Bumping the key invalidates those stale entries.
+    cache_key = f'/series/{series_id}/episodes/{season_type}?page=all&v=2'
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
     all_episodes = []
     current_page = 0
+    prev_page_size = None
     while True:
         data = _api_get(f'/series/{series_id}/episodes/{season_type}',
                         {'page': current_page})
-        if data and 'episodes' in data:
-            all_episodes.extend(data['episodes'])
-            # If less than a full page, we're done
-            if len(data['episodes']) < 500:
-                break
-            current_page += 1
-        else:
+        if not data or 'episodes' not in data:
+            break
+        page_eps = data['episodes']
+        if not page_eps:
+            break
+        all_episodes.extend(page_eps)
+        # Stop when a page is shorter than the previous one — TVDB's page size
+        # varies by endpoint/season type, so we can't hardcode it.
+        if prev_page_size is not None and len(page_eps) < prev_page_size:
+            break
+        prev_page_size = len(page_eps)
+        current_page += 1
+        # Hard safety cap to avoid runaway paging on a misbehaving API.
+        if current_page > 50:
             break
 
     _cache_set(cache_key, all_episodes)
@@ -753,7 +764,12 @@ def build_tvdb_popup(parent, filepaths, apply_callback, on_apply_done=None):
         orderings = r.get('ep_id_orderings', {})
         if not orderings:
             return '', 0, '', None
-        if ord_name and ord_name in orderings:
+        if ord_name:
+            # User picked a specific ordering — honor it exactly. If this row
+            # has no data under that ordering, show nothing rather than
+            # silently falling back to a different ordering.
+            if ord_name not in orderings:
+                return '', 0, '', None
             best = orderings[ord_name]
         else:
             best = max(orderings.values(), key=lambda x: x['match_score'])
@@ -771,7 +787,11 @@ def build_tvdb_popup(parent, filepaths, apply_callback, on_apply_done=None):
         orderings = r.get('ep_title_orderings', {})
         if not orderings:
             return '', None, None, ''
-        if ord_name and ord_name in orderings:
+        if ord_name:
+            # User picked a specific ordering — honor it exactly. No silent
+            # fallback to a different ordering for rows that lack data here.
+            if ord_name not in orderings:
+                return '', None, None, ''
             chosen_name = ord_name
             eps = orderings[ord_name]
         else:
