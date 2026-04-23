@@ -145,8 +145,14 @@ def get_resolution(streams):
                     return "4K"
                 elif width >= 1800 or height >= 1000:
                     return "HD"
+                elif width >= 1200 or height >= 700:
+                    return "720p"
+                elif width >= 700 or height >= 440:
+                    return "480p"
+                elif width >= 560 or height >= 320:
+                    return "360p"
                 else:
-                    return "SD"
+                    return "240p"
     return None
 
 
@@ -156,10 +162,16 @@ def get_bitrate(format_info):
     return None
 
 
+_ENCODING_ALIASES = {
+    'MPEG2VIDEO': 'MP2',
+}
+
+
 def get_encoding(streams):
     for stream in streams:
         if stream.get('codec_type') == 'video':
-            return stream.get('codec_name', '').upper()
+            name = stream.get('codec_name', '').upper()
+            return _ENCODING_ALIASES.get(name, name)
     return None
 
 
@@ -200,7 +212,7 @@ def build_output_filename(input_file, extension, streams, format_info,
 
     basename = os.path.basename(input_file)
 
-    pattern = r'\[\w+ \d+Mbps \w+\]\.\w+$'
+    pattern = r'\[\w+ [\d.]+Mbps \w+\]\.\w+$'
     has_tvdb_changes = any(v is not None for v in (tvdb_changes or {}).values())
     if not convert_force and not has_tvdb_changes and re.search(pattern, basename):
         return None
@@ -242,7 +254,7 @@ def build_output_filename(input_file, extension, streams, format_info,
     encoding = get_encoding(streams)
 
     # Strip any existing metadata tag so force-reprocess doesn't double it
-    filename = re.sub(r'\s*\[\w+\s+\d+Mbps\s+\w+\]', '', filename).rstrip()
+    filename = re.sub(r'\s*\[\w+\s+[\d.]+Mbps\s+\w+\]', '', filename).rstrip()
 
     # Sanitize illegal Windows filename characters (e.g. TVDB titles with '/')
     filename = re.sub(r'[/\\:*?"<>|]', ' -', filename)
@@ -256,7 +268,12 @@ def build_output_filename(input_file, extension, streams, format_info,
     if resolution:
         parts.append(resolution)
     if bitrate:
-        parts.append(f"{round(bitrate)}Mbps")
+        rounded = round(bitrate, 1)
+        if rounded < 1:
+            # Sub-1 Mbps: round to nearest 0.1, e.g. 0.87 → ".9Mbps"
+            parts.append(f"{rounded:.1f}".lstrip("0") + "Mbps")
+        else:
+            parts.append(f"{round(bitrate)}Mbps")
     if encoding:
         parts.append(encoding)
     if parts:
@@ -725,6 +742,8 @@ def launch_gui(terminal_cwd=None):
             self._proc_holder = {}
             self._file_paths = []
             self._tvdb_changes = {}  # filepath -> {year, sxxexx, episode_title}
+            self._multi_drop_active = False
+            self._multi_drop_sentinel = ""
 
             # Register the root window as a drop target so the whole app
             # accepts file/folder drops, not just the path entry field.
@@ -1022,9 +1041,15 @@ def launch_gui(terminal_cwd=None):
             if self.processing:
                 return
             path = self.path_var.get().strip()
+            # Preserve a multi-drop list until the user changes the path
+            # themselves — edits to path_var that still match our sentinel
+            # are just the programmatic set from _on_drop.
+            if self._multi_drop_active and path == self._multi_drop_sentinel:
+                return
+            self._multi_drop_active = False
             self.file_listbox.delete(0, tk.END)
             self._file_paths = []
-            _done_pat = re.compile(r'\[\w+ \d+Mbps \w+\]\.\w+$')
+            _done_pat = re.compile(r'\[\w+ [\d.]+Mbps \w+\]\.\w+$')
             if self.mode_var.get() == 'folder' and os.path.isdir(path):
                 for f in get_video_files(path):
                     self.file_listbox.insert(tk.END, f"  {os.path.basename(f)}")
@@ -1069,21 +1094,89 @@ def launch_gui(terminal_cwd=None):
         # ── Drag-and-drop ────────────────────────────────────────────────
 
         def _on_drop(self, event):
-            # tkinterdnd2 wraps paths containing spaces in braces: {C:\My Dir\file.mkv}
-            # Multiple dropped items arrive as: {path1} {path2} ...
-            # We take only the first item.
-            data = event.data.strip()
-            if data.startswith('{'):
-                end = data.index('}')
-                path = data[1:end]
-            else:
-                path = data.split()[0]
-            if os.path.isdir(path):
-                self.mode_var.set('folder')
-                self.path_var.set(path)
-            elif os.path.isfile(path):
-                self.mode_var.set('file')
-                self.path_var.set(path)
+            paths = self._parse_dropped_paths(event.data)
+            if not paths:
+                return
+
+            # Single item: keep the existing path-driven behavior so
+            # Browse / the entry field stay in sync with the listbox.
+            if len(paths) == 1:
+                p = paths[0]
+                if os.path.isdir(p):
+                    self.mode_var.set('folder')
+                    self.path_var.set(p)
+                elif os.path.isfile(p):
+                    self.mode_var.set('file')
+                    self.path_var.set(p)
+                return
+
+            # Multiple items: collect video files from dropped files and
+            # (non-recursively) dropped folders, preserving drop order and
+            # deduplicating.
+            collected = []
+            seen = set()
+            for p in paths:
+                if os.path.isdir(p):
+                    for f in get_video_files(p):
+                        if f not in seen:
+                            seen.add(f)
+                            collected.append(f)
+                elif os.path.isfile(p) and p.lower().endswith(VIDEO_EXTENSIONS):
+                    if p not in seen:
+                        seen.add(p)
+                        collected.append(p)
+
+            if not collected:
+                return
+
+            sentinel = f"[{len(collected)} items dropped]"
+            self._multi_drop_active = True
+            self._multi_drop_sentinel = sentinel
+            self.mode_var.set('file')
+            self.path_var.set(sentinel)
+
+            # Populate the listbox ourselves — the path_var trace will
+            # short-circuit while _multi_drop_active is True.
+            self.file_listbox.delete(0, tk.END)
+            self._file_paths = []
+            _done_pat = re.compile(r'\[\w+ [\d.]+Mbps \w+\]\.\w+$')
+            for f in collected:
+                self.file_listbox.insert(tk.END, f"  {os.path.basename(f)}")
+                self._file_paths.append(f)
+            for idx, f in enumerate(self._file_paths):
+                if _done_pat.search(os.path.basename(f)):
+                    self._set_file_status(idx, 'done')
+
+        @staticmethod
+        def _parse_dropped_paths(data):
+            """Split a tkinterdnd2 drop payload into individual paths.
+
+            Paths containing spaces are wrapped in braces: {C:\\My Dir\\a.mkv}.
+            Multiple items are space-separated, with each wrapped item
+            (if it contains a space) braced independently.
+            """
+            s = (data or '').strip()
+            out = []
+            i = 0
+            n = len(s)
+            while i < n:
+                if s[i].isspace():
+                    i += 1
+                    continue
+                if s[i] == '{':
+                    end = s.find('}', i + 1)
+                    if end == -1:
+                        out.append(s[i+1:].strip())
+                        break
+                    out.append(s[i+1:end])
+                    i = end + 1
+                else:
+                    j = i
+                    while j < n and not s[j].isspace():
+                        j += 1
+                    out.append(s[i:j])
+                    i = j
+            return [p for p in out if p]
 
         # ── Browse buttons ───────────────────────────────────────────────
 
@@ -1230,7 +1323,12 @@ def launch_gui(terminal_cwd=None):
 
             # Persist the folder for next launch
             run_cfg = load_config()
-            run_cfg['last_folder'] = path if self.mode_var.get() == 'folder' else os.path.dirname(path)
+            if self._multi_drop_active and self._file_paths:
+                run_cfg['last_folder'] = os.path.dirname(self._file_paths[0])
+            elif self.mode_var.get() == 'folder':
+                run_cfg['last_folder'] = path
+            else:
+                run_cfg['last_folder'] = os.path.dirname(path)
             save_config(run_cfg)
 
             # Map file path → listbox index for live status updates
