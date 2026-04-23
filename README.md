@@ -1,212 +1,169 @@
 # Video Standardizer
 
-A Python utility for cleaning up and standardizing a video library. It handles the full pipeline: remuxing files into a consistent container, selecting and filtering audio and subtitle tracks by language, normalizing audio language metadata, renaming files with structured episode tags, and tagging filenames with resolution and encoding info — all without ever re-encoding audio or video.
+A suite of Python tools for maintaining a video library on Windows. The centerpiece is **Video Standardizer** — a GUI/CLI utility that remuxes files into a consistent container, selects audio/subtitle tracks by language, normalizes metadata, renames files with structured episode tags, and appends resolution/encoding labels. Everything is a stream copy; audio and video are never re-encoded.
 
-It works well for processing downloaded TV episodes and movies that arrive in inconsistent states: mixed containers, wrong or missing language tags, multiple audio tracks in unwanted languages, embedded EIA-608 garbage captions, or arbitrary filenames.
+The repository also ships companion tools for **commercial removal** (Comskip + VideoReDo smart-render), **Plex thumbnail generation**, **TVDB metadata lookup**, and a collection of **library maintenance scripts** for finding, scanning, and cleaning media.
 
-The repository also ships companion tools for **commercial removal** ([batch_comskip.py](batch_comskip.py) + [batch_vrd_save.py](batch_vrd_save.py)) and several **library maintenance utilities** under [scripts/](scripts/) (find-by-extension, corruption scan, resolution report, empty-folder cleanup).
+## Contents
 
-## Features
+- [Feature overview](#feature-overview)
+- [Requirements](#requirements)
+- [Configuration (`config.env`)](#configuration-configenv)
+- [Video Standardizer](#video-standardizer-1)
+  - [GUI](#gui)
+  - [CLI](#cli)
+  - [Options](#options)
+  - [How it works](#how-it-works)
+- [TVDB Lookup](#tvdb-lookup)
+- [Commercial Removal](#commercial-removal-comskip--videoredo)
+- [Plex Episode Thumbnails](#plex-episode-thumbnails)
+- [Library Maintenance Scripts](#library-maintenance-scripts)
+- [License](#license)
 
-- **Zero re-encoding** — every operation is a stream copy; processing is fast regardless of file size
-- **Smart audio track selection** — keeps the best (most channels) track per language; English and Japanese kept by default; configurable per run
-- **Language normalization** — audio tracks with unknown/undefined language tags are automatically reassigned to English
-- **No-audio-drop safety** — if language filtering would eliminate all audio tracks, all tracks are kept instead
-- **Episode renaming** — parses and normalizes episode tags including multi-episode formats (`S01E01E02`, `S01E01-02`, `S01E01-E02`)
-- **Metadata filename tags** — appends `[HD 8Mbps HEVC]`-style labels to output filenames
-- **External subtitle support** — automatically picks up `.en.srt`, `.eng.srt`, `.srt`, or `.sub` sidecar files and embeds them
-- **Error logging** — failed conversions are written to `conversion_errors.log` with the full ffmpeg error for later review
-- **GUI and CLI modes** — full Tkinter GUI with live output, or fully scriptable from the command line
-- **TVDB integration** — look up and apply series year, correct episode IDs (`S01E01`), and proper episode titles directly from [TheTVDB](https://thetvdb.com), with support for multiple season orderings (Aired, DVD, Absolute, etc.)
-- **Commercial detection & removal** — batch-run [Comskip](https://www.kaashoek.com/comskip/) across a folder (or piped file list) and smart-render the detected ad regions out via [VideoReDo](https://www.videoredo.com/)'s silent COM interface; live Rich dashboard shows per-file phase, percent, and elapsed time
+## Feature overview
+
+| Tool | Entry point | GUI | CLI |
+|------|-------------|-----|-----|
+| Video Standardizer (remux + rename + tag) | [`video_standardizer.py`](video_standardizer.py) / [`video_standardizer.pyw`](video_standardizer.pyw) | ✅ | ✅ |
+| TVDB metadata enrichment (year / SxxExx / title) | [`tvdb_lookup.py`](tvdb_lookup.py) | ✅ (popup from main window) | via standardizer |
+| Commercial detection + smart-render removal | [`batch_comskip.py`](batch_comskip.py) | — | ✅ |
+| Plex episode thumbnails from frame at N% | [`plex_episode_thumbs.py`](plex_episode_thumbs.py) | — | ✅ |
+| Find files by extension | [`scripts/find_by_ext.py`](scripts/find_by_ext.py) | — | ✅ |
+| Find files by filename substring | [`scripts/find_by_name.py`](scripts/find_by_name.py) | — | ✅ |
+| Find malformed filenames (no `SxxExx` or no extension) | [`scripts/find_malformed.py`](scripts/find_malformed.py) | — | ✅ |
+| Scan for corrupt files | [`scripts/check_corrupt.py`](scripts/check_corrupt.py) | — | ✅ |
+| Scan for low-resolution files | [`scripts/check_resolution.py`](scripts/check_resolution.py) | — | ✅ |
+| Scan metadata for key/value matches | [`scripts/check_metadata.py`](scripts/check_metadata.py) | — | ✅ |
+| Remove empty directories | [`scripts/remove_empty_dirs.py`](scripts/remove_empty_dirs.py) | — | ✅ |
 
 ## Requirements
 
-- Python 3.8+
-- [FFmpeg](https://ffmpeg.org/download.html) (both `ffmpeg` and `ffprobe` must be on your `PATH`) — required for the standardizer
-- [Comskip](https://www.comskip.org/) — required for `batch_comskip.py`. A `comskip.exe` and `comskip.ini` are expected in [comskip_dst/](comskip_dst/) by default (override with `--comskip` / `--comskip-ini`).
-- [VideoReDo TVSuite v6](https://www.videoredo.com/) — required for `batch_comskip.py` and `batch_vrd_save.py`. The scripts talk to its `VideoReDo6.VideoReDoSilent` COM object (Windows only).
+- **Python 3.8+**
+- **[FFmpeg](https://ffmpeg.org/download.html)** — both `ffmpeg` and `ffprobe` on your `PATH`. Required by the standardizer, Plex thumbnails, and most scan scripts.
+- **[Comskip](https://www.comskip.org/)** — required by `batch_comskip.py`. A `comskip.exe` and `comskip.ini` are expected in [comskip_dst/](comskip_dst/) by default (override with `--comskip` / `--comskip-ini`).
+- **[VideoReDo TVSuite v6](https://www.videoredo.com/)** — required by `batch_comskip.py`. The driver talks to its `VideoReDo6.VideoReDoSilent` COM interface (Windows only).
+- **Plex Media Server** (local) — required by `plex_episode_thumbs.py`. The script must run on a machine that can read the library files directly.
 
 ### Python dependencies
 
-| Package | Purpose | Required? |
-|---------|---------|----------|
-| [`tkinterdnd2`](https://pypi.org/project/tkinterdnd2/) | Drag-and-drop files/folders onto the standardizer GUI input field | Standardizer GUI |
-| [`rich`](https://pypi.org/project/rich/) | Live batch dashboard used by `batch_comskip.py` | Comskip batch |
-| [`pywin32`](https://pypi.org/project/pywin32/) | Drives the VideoReDo silent COM interface | Comskip batch |
-| [`send2trash`](https://pypi.org/project/Send2Trash/) | Move originals to the recycle bin when using `--recycle` | Comskip batch (optional) |
-
-A free [TheTVDB](https://thetvdb.com) account and API key are required to use TVDB features. See [TVDB Setup](#tvdb-setup) below.
-
-## Installation
-
-No installation required. Clone or download the repository and run the script directly.
+| Package | Purpose | Required by |
+|---------|---------|-------------|
+| [`tkinterdnd2`](https://pypi.org/project/tkinterdnd2/) | Drag-and-drop files/folders onto the standardizer GUI input | Standardizer GUI |
+| [`rich`](https://pypi.org/project/rich/) | Live batch dashboard | `batch_comskip.py` |
+| [`pywin32`](https://pypi.org/project/pywin32/) | Drives the VideoReDo silent COM interface | `batch_comskip.py` |
+| [`send2trash`](https://pypi.org/project/Send2Trash/) | Recycle-bin deletes | `batch_comskip.py` (with `--recycle`), `scripts/check_corrupt.py`, `scripts/check_metadata.py`, `scripts/check_resolution.py`, `scripts/remove_empty_dirs.py` |
 
 ```
-git clone https://github.com/yourname/video-standardizer.git
-cd video-standardizer
-pip install tkinterdnd2
+pip install tkinterdnd2 rich pywin32 send2trash
 ```
 
-Ensure `ffmpeg` and `ffprobe` are available:
+No installation step beyond that — clone the repo and run the scripts directly.
+
+## Configuration (`config.env`)
+
+All tools that need credentials read them from a single `config.env` file in the repo root. Create it by hand:
 
 ```
-ffmpeg -version
-ffprobe -version
+apikey=your_tvdb_api_key_here
+plex_token=your_plex_token_here
+plex_url=http://127.0.0.1:32400
 ```
 
-## TVDB Setup
+| Key | Used by | Notes |
+|-----|---------|-------|
+| `apikey` | `tvdb_lookup.py` (TVDB popup) | Free key from [thetvdb.com](https://thetvdb.com) under **API Access**. Responses are cached locally in `tvdb_cache.json`. |
+| `plex_token` | `plex_episode_thumbs.py` | [How to find yours.](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/) Can also be passed as `--token`. |
+| `plex_url` | `plex_episode_thumbs.py` | Optional; defaults to `http://127.0.0.1:32400`. |
 
-TVDB lookup is optional — the tool works fully without it. To enable it:
+Each tool runs fine without the keys it doesn't need.
 
-1. Create a free account at [thetvdb.com](https://thetvdb.com).
-2. Generate an API key under **API Access** in your account settings.
-3. Create a file named `config.env` in the same folder as the scripts:
+## Video Standardizer
 
-```
-TVDB_API_KEY=your_api_key_here
-```
+### GUI
 
-API responses are cached locally in `tvdb_cache.json` to avoid redundant network calls.
+Double-click [`video_standardizer.pyw`](video_standardizer.pyw) to open the GUI without a console window, or run `python video_standardizer.py` with no arguments. The input path defaults to the last folder you processed.
 
-## Usage
+Layout:
 
-### GUI (recommended)
+- **Left panel** — mode (folder / single file), input path (drag-and-drop supported), optional output directory, container preference, audio language filter, and per-run options.
+- **Right panel (top)** — file list with live status icons:
+  - `⟳` running · `✓` done · `→` renamed · `—` skipped · `✗` failed
+  - **Show Plan** — preview exactly what will change per file.
+  - **TVDB Lookup** — open the enrichment popup (see below).
+  - **Clear Selection**
+- **Right panel (bottom)** — per-file and batch progress bars, plus a scrolling output log with colour-coded plan diffs.
+- **Stop** — terminates the active `ffmpeg` process immediately.
+- A **batch summary** (remuxed / renamed / skipped / failed) is printed after every run.
 
-Double-click `video_standardizer.pyw` to open the GUI with no console window. The input path defaults to the last folder you processed; on first run it defaults to the folder the script lives in.
+### CLI
 
-Or launch from a terminal (input path defaults to the terminal's current directory and is saved for future double-click launches):
-
-```
-python video_standardizer.py
-```
-
-The GUI layout:
-
-- **Left panel** — mode, input/output paths, container, language, and option controls.
-- **Right panel (top)** — file list with live status icons (⟳ running, ✓ done, → renamed, — skipped, ✗ failed). Select one or more files and click **Show Plan** to preview what will happen, or **TVDB Lookup** to enrich filenames from TheTVDB.
-- **Right panel (bottom)** — per-file and batch progress bars, plus a scrolling output log with colour-coded plan diffs and processing messages.
-- **Drag-and-drop** — drop a file or folder onto the input field (requires `tkinterdnd2`).
-- **Stop** button — terminates the active ffmpeg process immediately.
-- A **batch summary** (remuxed / renamed / skipped / failed counts) is printed after every run.
-
-### Command line — folder mode
-
-Process every video file in a folder:
+Process every video in a folder:
 
 ```
 python video_standardizer.py -f "C:\Videos\Show Season 1"
 ```
 
-### Command line — single file
+Process a single file:
 
 ```
 python video_standardizer.py -i "S01E01 - Pilot.mkv"
 ```
 
-### Interactive mode
+Run with no arguments to launch the GUI.
 
-Run with no arguments to be prompted for a path with tab-completion:
+### Options
 
-```
-python video_standardizer.py
-```
+CLI and GUI expose equivalent settings. Flags marked GUI-only are surfaced as checkboxes in the main window.
 
-## Options
+| CLI flag | GUI equivalent | Description |
+|----------|---------------|-------------|
+| `-f PATH` / `--folder` | Mode: Folder + Input | Folder of video files to process |
+| `-i FILE` / `--input` | Mode: Single File + Input | Process one file |
+| `-e EXT` / `--extension` | **Container** (MKV / MP4) | Preferred output container. Auto-adjusted if a subtitle codec demands otherwise. |
+| `--prefer-only` | **Prefer only** checkbox | Treat `--extension` as a *preference*: don't remux a file that's already in the other supported container (MKV ↔ MP4). Other containers still get remuxed. |
+| `-l LANG …` / `--languages` | **Keep Audio Languages** | Space-separated ISO 639-2 codes (default: `eng jpn`). Best track per language is kept; others dropped. |
+| `-r` / `--rename` | **Rename Only** | Rename without remuxing |
+| `-n` / `--norename` | **Keep Original Filename** | Keep the filename as-is; only change container/tracks |
+| — | **Keep Episode Suffix** | Preserve the existing episode title already in the filename |
+| `-c` / `--convert-force` | **Force Re-process** | Re-process files that already have a `[HD …]` tag |
+| `-o DIR` / `--output` | **Output Directory** | Write outputs to a different folder |
+| `-d` / `--dry-run` | **Dry Run** | Preview only — no files are written |
+| `-v` / `--verbose` | **Verbose Output** | Print the `ffmpeg` command and live progress stats |
+| — | **Delete Original After Re-process** | Remove the source file after a successful remux |
 
-| Flag | Long form | Description |
-|------|-----------|-------------|
-| `-f PATH` | `--folder` | Folder containing video files to process |
-| `-i FILE` | `--input` | Single input file |
-| `-e EXT` | `--extension` | Preferred output container: `mkv` (default) or `mp4`. Automatically adjusted for subtitle compatibility. |
-| `-l LANG ...` | `--languages` | Space-separated ISO 639-2 language codes to keep (default: `eng jpn`). The best track per language is kept. |
-| `-r` | `--rename` | Rename files only — skip remux entirely |
-| `-n` | `--norename` | Keep the original filename; only change the container/tracks |
-| `-c` | `--convert-force` | Re-process files that appear to have already been processed |
-| `-o DIR` | `--output` | Write output files to a different directory |
-| `-d` | `--dry-run` | Preview what would happen without writing any files |
-| `-v` | `--verbose` | Print full stream info and ffmpeg commands |
+### How it works
 
-## GUI Options
+1. **Probe** — `ffprobe` reads all stream metadata in a single call.
+2. **Audio selection** — for each language in `--languages`, the track with the most channels is kept. Tracks tagged `und`/`unk` are reassigned to English if no English track exists. If filtering would eliminate all audio tracks, all are kept instead.
+3. **Subtitle selection** — English and undefined subtitle tracks are kept; embedded EIA-608 captions are dropped in favour of proper subtitle streams.
+4. **Container selection** — selected subtitle codecs are checked against the target container's compatibility list. If any would require re-encoding, the container is switched automatically.
+5. **Filename building** — episode tags are normalised (`S01E01E02`, `S01E01-02`, `S01E01-E02`), TVDB changes are applied (if any), illegal characters are sanitized, and a metadata suffix is appended (`[HD 8Mbps HEVC]`).
+6. **Rename or remux** — if the selected tracks already match the input and the container is unchanged, the file is simply renamed. Otherwise `ffmpeg` remuxes with stream copy. Chapters and global metadata are preserved (`-map_chapters 0 -map_metadata 0`).
+7. **Error logging** — on `ffmpeg` failure, the filename, command, and stderr are appended to `conversion_errors.log`.
 
-The GUI exposes slightly different options than the CLI:
-
-| Option | Description |
-|--------|-------------|
-| **Dry Run** | Preview only — no files are written or renamed |
-| **Rename Only** | Rename files without remuxing, even if streams would normally differ |
-| **Keep Original Filename** | Preserve the input filename; only change container/tracks |
-| **Keep Episode Suffix** | Retain the existing episode title already in the filename |
-| **Force Re-process** | Skip the "already processed" check and re-process `[HD xMbps CODEC]` files |
-| **Delete Original After Re-process** | Remove the source file after a successful remux |
-| **Verbose Output** | Print the ffmpeg command and live progress stats |
+MKV supports a broad range of subtitle formats (SRT, ASS, PGS, VobSub, DVB, WebVTT, …). MP4 only natively carries text-based formats (`mov_text`, TTML). The container is picked automatically based on what the file actually contains.
 
 ## TVDB Lookup
 
-The **TVDB Lookup** button (available in the file list panel) opens a popup that queries [TheTVDB](https://thetvdb.com) for all selected files simultaneously. It provides three independently toggleable enrichment modes:
+The **TVDB Lookup** button in the main window opens a popup that queries [TheTVDB](https://thetvdb.com) for all selected files at once. Three enrichment modes, independently toggleable:
 
-### Year
-Looks up the series premiere year and inserts it into the output filename as `(Year)` just before the `[HD...]` metadata tag:
-```
-S01E01 - From Scratch (2006) [HD 2Mbps HEVC].mp4
-```
+- **Year** — inserts the series premiere year as `(YYYY)` before the `[HD …]` tag.
+- **Episode ID** — fuzzy-matches the filename's episode title against TVDB to derive the correct `SxxExx`.
+- **Episode Title** — for files that already have an `SxxExx` tag, applies the canonical TVDB episode title.
 
-### Episode ID
-Derives the correct `SxxExx` tag by fuzzy-matching the episode title found in the filename against TVDB episode records. Useful when files are named with episode titles but no structured episode number.
+TVDB supports multiple ordering schemes per series (Aired, DVD, Absolute, …). A dropdown lets you switch orderings and see how episode assignments change before applying. Confidence scores are colour-coded green/yellow/red in the results table.
 
-### Episode Title
-Looks up the canonical TVDB episode title for a file that already has an `SxxExx` tag and applies it to the output filename:
-```
-S01E01 - Curious George Flies a Kite - From Scratch [HD 2Mbps HEVC].mp4
-```
+**Workflow:** select files → **TVDB Lookup** → pick modes and ordering → deselect unwanted rows → **Apply** → **Show Plan** or **Run**. Applied changes persist for the session.
 
-### Season Orderings
-TVDB supports multiple ordering schemes per series (Aired Order, DVD Order, Absolute Order, etc.). After lookup completes, a dropdown lets you switch between all available orderings and see how the episode assignment changes before applying.
-
-### Workflow
-1. Select one or more files in the file list.
-2. Click **TVDB Lookup** — results appear in a table, one row per file, with confidence scores colour-coded green/yellow/red.
-3. Choose **Year**, **Episode ID**, or **Episode Title** (or any combination).
-4. Optionally select a different season ordering from the dropdown.
-5. Deselect any rows you don't want to change.
-6. Click **Apply** — the changes are queued per file and shown in the output log.
-7. Click **Show Plan** or **Run** to see/apply the final output filenames.
-
-Applied changes persist for the session. Re-opening TVDB Lookup and clicking Apply again will overwrite the previous selection for that file.
-
-## How it works
-
-1. **Probe** — `ffprobe` reads all stream metadata in a single call.
-2. **Audio selection** — for each language in `--languages`, the track with the most channels is selected. Tracks tagged `und`/`unk` are reassigned to English if no English track exists. If the filter would produce zero audio tracks, all tracks are kept.
-3. **Subtitle selection** — English and undefined subtitle tracks are kept; EIA-608 embedded captions are dropped in favour of proper subtitle streams.
-4. **Container selection** — selected subtitle codecs are checked against the preferred container's compatibility list. If any codec would require re-encoding, the container is switched to a more compatible option automatically.
-5. **Filename building** — episode tags are extracted and normalised (`S01E01E02`, `S01E01-02`, etc.), TVDB changes (if any) are applied, illegal filename characters are sanitized, and a metadata suffix is appended (`[HD 8Mbps HEVC]`).
-6. **Rename or remux** — if the selected tracks already match the input and the container is unchanged, the file is simply renamed. Otherwise, `ffmpeg` remuxes with stream copy for all tracks. Chapters and global metadata are always preserved (`-map_chapters 0 -map_metadata 0`).
-7. **Error logging** — if ffmpeg exits with an error, the filename, full command, and stderr output are appended to `conversion_errors.log` in the script directory.
-
-## Subtitle container compatibility
-
-MKV supports a broad range of subtitle formats (SRT, ASS, PGS, VobSub, DVB, WebVTT, and more). MP4 only natively carries text-based formats (`mov_text`, TTML). The tool picks the container automatically based on what the file actually contains — you never need to worry about this.
-
-## Language codes
-
-Use [ISO 639-2/B](https://en.wikipedia.org/wiki/List_of_ISO_639-2_codes) three-letter codes. Common examples:
-
-| Language | Code |
-|----------|------|
-| English | `eng` |
-| Japanese | `jpn` |
-| Spanish | `spa` |
-| French | `fra` |
-| German | `deu` |
-| Chinese | `zho` |
-| Korean | `kor` |
+Requires `apikey=` in `config.env`.
 
 ## Commercial Removal (Comskip + VideoReDo)
 
-`batch_comskip.py` walks a folder (or reads a file list from stdin), runs Comskip on each video to detect ad regions, then hands the resulting `.VPrj` to a silent VideoReDo instance which **smart-renders** (no re-encode) the source minus the cut regions. Output is written next to the source as `<stem>_no_ads.mkv`.
+[`batch_comskip.py`](batch_comskip.py) walks a folder (or reads paths from stdin), runs Comskip on each video to detect ad regions, then hands the resulting `.VPrj` to a silent VideoReDo instance which **smart-renders** (no re-encode) the source minus the cut regions. Output is written next to the source as `<stem>_no_ads.mkv`.
 
-`batch_vrd_save.py` isn't a standalone entry point — it's the shared library that exposes the VideoReDo save pipeline, the Rich live dashboard, and video discovery helpers. `batch_comskip.py` is the driver.
+A live Rich dashboard shows per-file phase, percent, and elapsed time.
+
+[`batch_vrd_save.py`](batch_vrd_save.py) is the shared library: VideoReDo save pipeline, live dashboard, and video discovery helpers. Not a standalone entry point.
 
 ### Usage
 
@@ -216,13 +173,13 @@ Process every video in a folder:
 python batch_comskip.py "C:\Recorded TV"
 ```
 
-Process a piped list of paths (one per line) — pairs well with `scripts/find_by_ext.py`:
+Process a piped list of paths (one per line):
 
 ```
 python scripts/find_by_ext.py "C:\Recorded TV" --ext .ts | python batch_comskip.py -
 ```
 
-Replace originals with the cleaned output (originals go to the recycle bin, output is renamed into place as `.mkv`):
+Replace originals with the cleaned output (originals go to the recycle bin):
 
 ```
 python batch_comskip.py "C:\Recorded TV" --recycle
@@ -233,34 +190,137 @@ python batch_comskip.py "C:\Recorded TV" --recycle
 | Flag | Description |
 |------|-------------|
 | `directory` / `-` | Root folder to scan, or `-` to read newline-separated paths from stdin |
-| `--threads N` | Parallel worker count (default: 8). Each worker runs Comskip and a VideoReDo instance in sequence. |
-| `--recycle` | Send the original to the recycle bin and rename the `_no_ads` output to take its place |
+| `--threads N` | Parallel worker count (default: 10). Each worker runs Comskip and a VideoReDo instance in sequence. |
+| `--recycle` | Send originals to the recycle bin and rename the `_no_ads` output into their place |
 | `--comskip PATH` | Path to `comskip.exe` (default: `comskip_dst/comskip.exe`) |
 | `--comskip-ini PATH` | Path to `comskip.ini` (default: `comskip_dst/comskip.ini`) |
+| `--start-at N` | Resume from the Nth file (1-indexed) — useful after a crash |
 
-### Behaviour notes
+Behaviour:
 
-- Files that already end in `_no_ads` are skipped (they're assumed to be prior outputs of this tool).
-- A file where Comskip detects zero cuts is reported as "No ads" and left alone — not counted as an error.
-- Comskip sidecar files (`.VPrj`, `.edl`, `.log`, `.logo.txt`, `.txt`) are cleaned up after each file regardless of success.
-- Ctrl+C signals a graceful stop: active workers finish their current file, no new files are started.
+- Files already ending in `_no_ads` are skipped.
+- Zero-cut files are reported "No ads" and left alone — not counted as errors.
+- Comskip sidecars (`.VPrj`, `.edl`, `.log`, `.logo.txt`, `.txt`) are cleaned up after each file.
+- Ctrl+C signals a graceful stop: active workers finish their current file; no new files start.
+
+## Plex Episode Thumbnails
+
+[`plex_episode_thumbs.py`](plex_episode_thumbs.py) grabs a frame from N% into every episode of a given show/season and uploads it as the Plex thumbnail. Useful when Plex has generated poor auto-thumbs (e.g. a title card or black frame).
+
+```
+python plex_episode_thumbs.py "Firefly" 1
+python plex_episode_thumbs.py "Arthur" --all --percent 15
+python plex_episode_thumbs.py "Firefly" 1 --dry-run
+```
+
+| Argument / flag | Description |
+|-----------------|-------------|
+| `show` | Show title as it appears in your Plex library |
+| `season` | Season number (omit when using `--all`) |
+| `--all` | Process every season |
+| `--percent` | Frame position as % of runtime (default: 10) |
+| `--token` | Plex token (defaults to `plex_token` in `config.env`) |
+| `--dry-run` | Print the plan without touching anything |
+
+Requires `plex_token=` in `config.env`. Uses system `ffmpeg` to extract frames and posts the JPEG to `/library/metadata/<ratingKey>/posters`.
 
 ## Library Maintenance Scripts
 
-Small utilities under [scripts/](scripts/) for housekeeping a video library:
+Small utilities under [scripts/](scripts/) for housekeeping. Each one prints file paths to **stdout** and status/progress to **stderr**, so outputs pipe cleanly into other tools (e.g. `batch_comskip.py -`).
 
-| Script | Purpose |
-|--------|---------|
-| [`find_by_ext.py`](scripts/find_by_ext.py) | Recursively list every file with a given extension. Paths are printed to stdout (status messages go to stderr) so the output can be piped into other tools like `batch_comskip.py`. |
-| [`check_corrupt.py`](scripts/check_corrupt.py) | Scan a library with `ffmpeg` to flag files that fail to decode cleanly. |
-| [`check_resolution.py`](scripts/check_resolution.py) | Report the resolution of every video under a folder. |
-| [`remove_empty_dirs.py`](scripts/remove_empty_dirs.py) | Recursively remove empty subdirectories from a folder tree. |
-
-Example — run commercial removal on every `.ts` file in a folder tree:
+### `find_by_ext.py` — files by extension
 
 ```
-python scripts/find_by_ext.py "D:\DVR" --ext .ts | python batch_comskip.py -
+python scripts/find_by_ext.py "D:\DVR" --ext .ts
 ```
+
+| Flag | Description |
+|------|-------------|
+| `directory` | Root to scan |
+| `--ext` | Extension to match (default: `.mpg`) |
+
+### `find_by_name.py` — files by filename substring
+
+```
+python scripts/find_by_name.py "D:\DVR" --search MPEG2VIDEO
+```
+
+| Flag | Description |
+|------|-------------|
+| `directory` | Root to scan |
+| `--search` | Case-insensitive substring to match in the filename (default: `MPEG2VIDEO`) |
+| `--all-files` | Search all file types, not just known video extensions |
+
+### `find_malformed.py` — files missing `SxxExx` or extension
+
+```
+python scripts/find_malformed.py "D:\TV" | python video_standardizer.py -
+```
+
+| Flag | Description |
+|------|-------------|
+| `directory` | Root to scan |
+| `--all-files` | Consider all file types (files without any extension are always reported) |
+
+### `check_corrupt.py` — decode-scan for broken files
+
+Samples random seconds from each file with `ffmpeg -c copy -f null` and flags any that fail to decode.
+
+```
+python scripts/check_corrupt.py "D:\TV" --samples 15 --threshold 50
+```
+
+| Flag | Description |
+|------|-------------|
+| `directory` | Root to scan |
+| `--ext` | Only check files with this extension |
+| `--name` | Only check files with this substring in the filename |
+| `--workers N` | Parallel decode jobs (default: min(8, CPUs)) |
+| `--samples N` | Random sample points per file (default: 15) |
+| `--sample-seconds` | Duration of each sample (default: 20.0) |
+| `--threshold N` | Max acceptable decode errors per file (default: 50) |
+| `--full` | Decode the entire file instead of sampling |
+| `--timeout` | Per-file timeout in seconds (default: 120) |
+| `--recycle` | Send flagged files to the recycle bin |
+| `-v` / `--verbose` | Print ffmpeg stderr for matches |
+
+### `check_resolution.py` — find low-resolution files
+
+```
+python scripts/check_resolution.py "D:\TV" --min-height 480
+```
+
+| Flag | Description |
+|------|-------------|
+| `directory` | Root to scan |
+| `--min-height` | Files below this vertical resolution are flagged (default: 360) |
+| `--workers N` | Parallel probes (default: min(8, CPUs)) |
+| `--recycle` | Send flagged files to the recycle bin |
+
+### `check_metadata.py` — find files with matching metadata
+
+Uses `ffprobe` to match files by a metadata key/value pair.
+
+```
+python scripts/check_metadata.py "D:\TV" --key encoder --value Hulu
+python scripts/check_metadata.py "D:\TV" --value Hulu      # search any key/value
+```
+
+| Flag | Description |
+|------|-------------|
+| `directory` | Root to scan |
+| `--key` | Metadata key to check (if omitted, matches any key or value) |
+| `--value` | Substring to match (default: `Hulu`) |
+| `--workers N` | Parallel probes (default: min(8, CPUs)) |
+| `--recycle` | Send flagged files to the recycle bin |
+
+### `remove_empty_dirs.py` — clean up empty folders
+
+```
+python scripts/remove_empty_dirs.py "D:\TV"
+```
+
+Recursively sends empty subdirectories to the recycle bin.
 
 ## License
 
