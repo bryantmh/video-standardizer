@@ -16,6 +16,11 @@ import argparse
 import os
 import sys
 
+# Ensure Unicode paths print cleanly when piped on Windows (default cp1252
+# stdout can't encode characters like ? in filenames).
+sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 
 def main():
     parser = argparse.ArgumentParser(description='Find video files by extension.')

@@ -29,6 +29,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from send2trash import send2trash
 
+# Match UTF-8 on all three streams on Windows: our upstream producers
+# (find_by_ext, find_by_name) emit UTF-8, and the default cp1252 stdout can't
+# encode characters like é in filenames without lossy replacement.
+sys.stdin.reconfigure(encoding='utf-8', errors='replace')
+sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 VIDEO_EXTS = {
     '.mp4', '.mkv', '.avi', '.mov', '.wmv', '.m4v', '.ts', '.m2ts',
     '.mpg', '.mpeg', '.flv', '.webm', '.vob', '.divx', '.xvid', '.rmvb',
@@ -64,12 +71,22 @@ BENIGN_PATTERNS = (
 )
 
 
-def find_videos(root: str) -> list[str]:
+def find_videos(root: str, *, ext: str | None = None,
+                name: str | None = None) -> list[str]:
+    """Walk ``root`` for video files, optionally filtered by extension or name."""
+    ext_filter = ext.lower() if ext else None
+    name_filter = name.lower() if name else None
     paths = []
     for dirpath, _dirs, files in os.walk(root):
         for f in files:
-            if os.path.splitext(f)[1].lower() in VIDEO_EXTS:
-                paths.append(os.path.join(dirpath, f))
+            file_ext = os.path.splitext(f)[1].lower()
+            if file_ext not in VIDEO_EXTS:
+                continue
+            if ext_filter and file_ext != ext_filter:
+                continue
+            if name_filter and name_filter not in f.lower():
+                continue
+            paths.append(os.path.join(dirpath, f))
     return paths
 
 
@@ -208,6 +225,14 @@ def main():
     parser.add_argument('directory',
                         help='Root directory to scan, or "-" to read '
                              'newline-separated file paths from stdin')
+    parser.add_argument('--ext',
+                        help='Only scan files with this extension (e.g. .mp4). '
+                             'In-process equivalent of piping find_by_ext.py, '
+                             'avoids PowerShell pipe encoding issues.')
+    parser.add_argument('--name',
+                        help='Only scan files whose name contains this substring '
+                             '(case-insensitive). In-process equivalent of piping '
+                             'find_by_name.py, avoids PowerShell pipe encoding issues.')
     parser.add_argument('--workers', type=int, default=min(8, (os.cpu_count() or 4)),
                         help='Parallel workers (default: min(8, cpu_count))')
     parser.add_argument('--samples', type=int, default=15,
@@ -240,8 +265,17 @@ def main():
         if not os.path.isdir(args.directory):
             print(f'ERROR: not a directory: {args.directory}', file=sys.stderr)
             sys.exit(1)
-        videos = find_videos(args.directory)
-        source_desc = args.directory
+        ext = args.ext
+        if ext and not ext.startswith('.'):
+            ext = '.' + ext
+        videos = find_videos(args.directory, ext=ext, name=args.name)
+        filters = []
+        if ext:
+            filters.append(f'ext={ext}')
+        if args.name:
+            filters.append(f'name~={args.name!r}')
+        source_desc = (f'{args.directory} ({", ".join(filters)})'
+                       if filters else args.directory)
 
     print(f'Scanning {source_desc!r} ...')
     total = len(videos)
