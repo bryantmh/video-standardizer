@@ -299,7 +299,22 @@ def get_supported_subtitle_codecs(container):
     return SUBTITLE_CODECS_BY_CONTAINER.get(container, set())
 
 
-def determine_best_extension(preferred_extension, selected_subtitle_codecs):
+SUPPORTED_CONTAINERS = ('mkv', 'mp4')
+
+
+def determine_best_extension(preferred_extension, selected_subtitle_codecs,
+                              input_ext=None, prefer_only=False):
+    # "Prefer only" mode: if the input is already one of the supported
+    # containers, keep it instead of remuxing to the preferred one — but
+    # only when the input container can actually hold the selected subs.
+    if (prefer_only and input_ext and input_ext.lower() in SUPPORTED_CONTAINERS):
+        input_ext_lc = input_ext.lower()
+        if not selected_subtitle_codecs:
+            return input_ext_lc
+        input_supported = get_supported_subtitle_codecs(input_ext_lc)
+        if all(c in input_supported for c in selected_subtitle_codecs):
+            return input_ext_lc
+
     if not selected_subtitle_codecs:
         return preferred_extension
 
@@ -319,7 +334,7 @@ def process_file(file, extension="mkv", dry_run=False, rename=False, verbose=Fal
                  norename=False, convert_force=False,
                  output_dir=None, keep_languages=None, print_fn=None,
                  progress_fn=None, proc_holder=None, status_fn=None, keep_suffix=False,
-                 tvdb_changes=None):
+                 tvdb_changes=None, prefer_only=False):
     """Process a single video file.
 
     Returns a dict with 'status': 'renamed' | 'remuxed' | 'skipped' | 'failed' | 'dry_run'.
@@ -349,10 +364,37 @@ def process_file(file, extension="mkv", dry_run=False, rename=False, verbose=Fal
     subtitle_streams_all = [s for s in streams if s.get('codec_type') == 'subtitle']
 
     selected_sub_codecs = [subtitle_streams_all[i].get('codec_name', '') for i in subtitle_selection]
-    actual_extension = determine_best_extension(extension, selected_sub_codecs)
+    input_ext_for_container = os.path.splitext(file)[1].lstrip('.').lower()
+
+    # Look ahead: would we otherwise rename-only? Prefer-only only kicks
+    # in if a remux isn't already required for some other reason (audio
+    # relabel, stream trim, external sub).
+    base_file_name = os.path.splitext(file)[0]
+    subtitle_file = None
+    for _ext in ('.en.srt', '.eng.srt', '.srt', '.sub'):
+        candidate = base_file_name + _ext
+        if os.path.exists(candidate):
+            subtitle_file = candidate
+            break
+
+    needs_language_change = any(a[2] for a in audio_selection)
+    same_audio = len(audio_selection) == len(audio_streams_all) and not needs_language_change
+    same_subs = len(subtitle_selection) == len(subtitle_streams_all)
+    no_external_subs = subtitle_file is None
+    would_rename_only = rename or (same_audio and same_subs and no_external_subs)
+
+    actual_extension = determine_best_extension(
+        extension, selected_sub_codecs,
+        input_ext=input_ext_for_container,
+        prefer_only=prefer_only and would_rename_only,
+    )
     if actual_extension != extension:
-        print_fn(f"  Note: Using {actual_extension.upper()} instead of {extension.upper()} "
-                 f"for subtitle compatibility")
+        if prefer_only and actual_extension == input_ext_for_container:
+            print_fn(f"  Note: Keeping {actual_extension.upper()} (prefer-only: input is "
+                     f"already a supported container and would be rename-only)")
+        else:
+            print_fn(f"  Note: Using {actual_extension.upper()} instead of {extension.upper()} "
+                     f"for subtitle compatibility")
 
     output_file = build_output_filename(file, actual_extension, streams, format_info,
                                         norename, convert_force, output_dir,
@@ -362,22 +404,10 @@ def process_file(file, extension="mkv", dry_run=False, rename=False, verbose=Fal
         print_fn(f"Skipping {file} as it is already processed")
         return {'status': 'skipped'}
 
-    base_file_name = os.path.splitext(file)[0]
-    subtitle_file = None
-    for ext in ['.en.srt', '.eng.srt', '.srt', '.sub']:
-        candidate = base_file_name + ext
-        if os.path.exists(candidate):
-            subtitle_file = candidate
-            break
-
-    needs_language_change = any(a[2] for a in audio_selection)
-    same_audio = len(audio_selection) == len(audio_streams_all) and not needs_language_change
-    same_subs = len(subtitle_selection) == len(subtitle_streams_all)
-    no_external_subs = subtitle_file is None
-    input_ext = os.path.splitext(file)[1].lstrip('.').lower()
+    input_ext = input_ext_for_container
     same_container = input_ext == actual_extension.lower()
 
-    if same_container and (rename or (same_audio and same_subs and no_external_subs)):
+    if same_container and would_rename_only:
         original_ext = os.path.splitext(file)[1]
         output_with_orig = os.path.splitext(output_file)[0] + original_ext
         if os.path.normpath(file) == os.path.normpath(output_with_orig):
@@ -520,7 +550,7 @@ def process_file(file, extension="mkv", dry_run=False, rename=False, verbose=Fal
 
 def build_file_plan(file, extension="mkv", norename=False, convert_force=False,
                     output_dir=None, keep_languages=None, keep_suffix=False,
-                    tvdb_changes=None, rename=False):
+                    tvdb_changes=None, rename=False, prefer_only=False):
     """Return a human-readable diff of what will be done to a file."""
     if keep_languages is None:
         keep_languages = list(DEFAULT_KEEP_LANGUAGES)
@@ -540,13 +570,26 @@ def build_file_plan(file, extension="mkv", norename=False, convert_force=False,
     video_streams_all = [s for s in streams if s.get('codec_type') == 'video']
 
     selected_sub_codecs = [subtitle_streams_all[i].get('codec_name', '') for i in subtitle_selection]
-    actual_extension = determine_best_extension(extension, selected_sub_codecs)
+    input_ext_for_container = os.path.splitext(file)[1].lstrip('.').lower()
 
     # Check for external subtitle file alongside the video
     _base = os.path.splitext(file)[0]
     external_sub = next(
         ((_base + ext) for ext in ('.en.srt', '.eng.srt', '.srt', '.sub')
          if os.path.exists(_base + ext)), None)
+
+    # Look ahead: would a remux be required even without the container
+    # change? Prefer-only only applies when the answer is no.
+    needs_language_change = any(a[2] for a in audio_selection)
+    same_audio = len(audio_selection) == len(audio_streams_all) and not needs_language_change
+    same_subs = len(subtitle_selection) == len(subtitle_streams_all)
+    would_rename_only = rename or (same_audio and same_subs and external_sub is None)
+
+    actual_extension = determine_best_extension(
+        extension, selected_sub_codecs,
+        input_ext=input_ext_for_container,
+        prefer_only=prefer_only and would_rename_only,
+    )
 
     output_file = build_output_filename(file, actual_extension, streams, format_info,
                                         norename, convert_force, output_dir,
@@ -570,14 +613,12 @@ def build_file_plan(file, extension="mkv", norename=False, convert_force=False,
     in_name = os.path.basename(file)
     lines.append(f"Output:   {out_name}" if out_name != in_name else "Output:   (same name)")
 
-    # Determine action: rename-only vs remux
-    # Mirrors process_file logic: rename flag OR (same streams AND same container)
-    needs_language_change = any(a[2] for a in audio_selection)
-    same_audio = len(audio_selection) == len(audio_streams_all) and not needs_language_change
-    same_subs = len(subtitle_selection) == len(subtitle_streams_all)
-    input_ext = os.path.splitext(file)[1].lstrip('.').lower()
+    # Determine action: rename-only vs remux.
+    # Mirrors process_file logic: we only rename if the container already
+    # matches AND no stream-level changes are needed.
+    input_ext = input_ext_for_container
     same_container = input_ext == actual_extension.lower()
-    will_rename = same_container and (rename or (same_audio and same_subs and external_sub is None))
+    will_rename = same_container and would_rename_only
     lines.append(f"Action:   {'RENAME ONLY (no re-encode)' if will_rename else 'REMUX (re-mux streams)'}")
 
     lines.append(f"File:     {os.path.basename(file)}")
@@ -672,6 +713,10 @@ def main():
     parser.add_argument("-i", "--input", help="Single input file name")
     parser.add_argument("-d", "--dry-run", action='store_true', help="Print commands without executing")
     parser.add_argument("-e", "--extension", default='mkv', help="Output container (default: mkv)")
+    parser.add_argument("--prefer-only", action='store_true',
+                        help="Treat --extension as a preference between MKV/MP4: "
+                             "don't remux a file that's already in the other supported "
+                             "container. Other containers still get remuxed.")
     parser.add_argument("-r", "--rename", action='store_true', help="Just rename files without re-encoding")
     parser.add_argument("-v", "--verbose", action='store_true', help="Print detailed information")
     parser.add_argument("-n", "--norename", action="store_true", help="Keep original filename")
@@ -700,7 +745,8 @@ def main():
     for file in files:
         process_file(file, args.extension, args.dry_run, args.rename, args.verbose,
                      args.norename, args.convert_force,
-                     args.output, args.languages)
+                     args.output, args.languages,
+                     prefer_only=args.prefer_only)
 
 
 def launch_gui(terminal_cwd=None):
@@ -860,9 +906,17 @@ def launch_gui(terminal_cwd=None):
             container_frame = ttk.LabelFrame(left_frame, text="Container", padding=5)
             container_frame.pack(fill=tk.X, padx=5, pady=2)
             self.extension_var = tk.StringVar(value="mkv")
+            radio_row = ttk.Frame(container_frame)
+            radio_row.pack(fill=tk.X)
             for ext in ["mkv", "mp4"]:
-                ttk.Radiobutton(container_frame, text=ext.upper(),
+                ttk.Radiobutton(radio_row, text=ext.upper(),
                                 variable=self.extension_var, value=ext).pack(side=tk.LEFT, padx=5)
+            self.prefer_only_var = tk.BooleanVar(value=True)
+            ttk.Checkbutton(
+                container_frame,
+                text="Prefer only (don't remux between MKV/MP4)",
+                variable=self.prefer_only_var,
+            ).pack(anchor=tk.W, padx=2, pady=(3, 0))
 
             # Languages
             lang_frame = ttk.LabelFrame(left_frame, text="Keep Audio Languages", padding=5)
@@ -1267,6 +1321,7 @@ def launch_gui(terminal_cwd=None):
                         keep_suffix=self.keep_suffix_var.get(),
                         tvdb_changes=self._tvdb_changes.get(f),
                         rename=self.rename_var.get(),
+                        prefer_only=self.prefer_only_var.get(),
                     )
                     self._log_plan(plan)
                 except Exception as e:
@@ -1359,6 +1414,7 @@ def launch_gui(terminal_cwd=None):
             force = self.force_var.get()
             keep_suffix = self.keep_suffix_var.get()
             delete_original = self.delete_original_var.get()
+            prefer_only = self.prefer_only_var.get()
 
             def print_fn(msg, tag=None):
                 self.root.after(0, self._log, msg, tag)
@@ -1385,7 +1441,7 @@ def launch_gui(terminal_cwd=None):
                                 convert_force=force, output_dir=output_dir,
                                 keep_languages=languages, keep_suffix=keep_suffix,
                                 tvdb_changes=self._tvdb_changes.get(f),
-                                rename=rename,
+                                rename=rename, prefer_only=prefer_only,
                             )
                             print_plan(plan)
                         except Exception as pe:
@@ -1418,6 +1474,7 @@ def launch_gui(terminal_cwd=None):
                             proc_holder=self._proc_holder,
                             status_fn=make_status_fn(),
                             tvdb_changes=self._tvdb_changes.get(f),
+                            prefer_only=prefer_only,
                         )
 
                         status = (result or {}).get('status', 'skipped')
