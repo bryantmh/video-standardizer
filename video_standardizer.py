@@ -1,4 +1,5 @@
 import subprocess
+import sys
 import json
 import re
 import os
@@ -757,7 +758,7 @@ def launch_gui(terminal_cwd=None):
     the script's own directory is used — never os.getcwd().
     """
     import tkinter as tk
-    from tkinter import ttk, filedialog, scrolledtext
+    from tkinter import ttk, filedialog, simpledialog
     from tkinterdnd2 import DND_FILES, TkinterDnD
 
     # ── Resolve default path and persist terminal_cwd if applicable ──────
@@ -795,6 +796,14 @@ def launch_gui(terminal_cwd=None):
             # accepts file/folder drops, not just the path entry field.
             self.root.drop_target_register(DND_FILES)
             self.root.dnd_bind('<<Drop>>', self._on_drop)
+
+            # ── Menu bar ─────────────────────────────────────────────────
+            menubar = tk.Menu(self.root)
+            tools_menu = tk.Menu(menubar, tearoff=0)
+            tools_menu.add_command(label="Plex Thumbnails",
+                                   command=self._open_plex_popup)
+            menubar.add_cascade(label="Tools", menu=tools_menu)
+            self.root.configure(menu=menubar)
 
             # ── Dark mode colours ────────────────────────────────────────
             _BG  = '#1e1e1e'
@@ -846,10 +855,27 @@ def launch_gui(terminal_cwd=None):
                 bordercolor=_BOR, lightcolor=_SEL, darkcolor=_SEL)
             style.configure('Vertical.TScrollbar',
                 troughcolor=_BG2, background=_ENT,
-                bordercolor=_BOR, arrowcolor=_FG)
+                bordercolor=_BOR, arrowcolor=_FG,
+                lightcolor=_ENT, darkcolor=_ENT)
+            style.map('Vertical.TScrollbar',
+                background=[('active', '#4c4c4c'), ('pressed', _SEL)],
+                arrowcolor=[('disabled', '#606060')])
             style.configure('Horizontal.TScrollbar',
                 troughcolor=_BG2, background=_ENT,
-                bordercolor=_BOR, arrowcolor=_FG)
+                bordercolor=_BOR, arrowcolor=_FG,
+                lightcolor=_ENT, darkcolor=_ENT)
+            style.map('Horizontal.TScrollbar',
+                background=[('active', '#4c4c4c'), ('pressed', _SEL)])
+
+            # ttk.Combobox dropdown is a classic Tk Listbox — its colours come
+            # from the option database, not the ttk style engine. Set them
+            # here so both the main window's and the TVDB popup's comboboxes
+            # get a dark dropdown menu without needing per-popup wiring.
+            self.root.option_add('*TCombobox*Listbox.background', _BG2)
+            self.root.option_add('*TCombobox*Listbox.foreground', _FG)
+            self.root.option_add('*TCombobox*Listbox.selectBackground', _SEL)
+            self.root.option_add('*TCombobox*Listbox.selectForeground', '#ffffff')
+            self.root.option_add('*TCombobox*Listbox.borderWidth', 0)
             # Accent style for primary action button
             _ACC = '#0e639c'
             style.configure('Accent.TButton',
@@ -948,6 +974,9 @@ def launch_gui(terminal_cwd=None):
             self.delete_original_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(opts_frame, text="Delete Original After Re-process",
                             variable=self.delete_original_var).pack(anchor=tk.W)
+            self.remove_ads_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(opts_frame, text="Remove Ads First (Comskip + VideoReDo)",
+                            variable=self.remove_ads_var).pack(anchor=tk.W)
             ttk.Checkbutton(opts_frame, text="Verbose Output",
                             variable=self.verbose_var).pack(anchor=tk.W)
 
@@ -972,8 +1001,27 @@ def launch_gui(terminal_cwd=None):
             list_frame = ttk.LabelFrame(right_pane, text="Files")
             right_pane.add(list_frame, weight=1)
 
+            # Find toolbar — each button replaces the file list with a
+            # filtered scan of the current input path.
+            find_bar = ttk.Frame(list_frame)
+            find_bar.pack(fill=tk.X, padx=5, pady=(5, 0))
+            ttk.Label(find_bar, text="Find:", font=("", 9, "bold")).pack(
+                side=tk.LEFT, padx=(0, 6))
+            self._find_buttons = []
+            for label, cmd in (
+                ("By Ext",    self._find_by_ext),
+                ("By Name",   self._find_by_name),
+                ("Malformed", self._find_malformed),
+                ("Low-res",   self._find_low_res),
+                ("Corrupt",   self._find_corrupt),
+                ("Metadata",  self._find_metadata),
+            ):
+                b = ttk.Button(find_bar, text=label, command=cmd)
+                b.pack(side=tk.LEFT, padx=(0, 3))
+                self._find_buttons.append(b)
+
             list_inner = ttk.Frame(list_frame)
-            list_inner.pack(fill=tk.BOTH, expand=True, padx=5, pady=(5, 2))
+            list_inner.pack(fill=tk.BOTH, expand=True, padx=5, pady=(3, 2))
 
             list_scroll = ttk.Scrollbar(list_inner, orient=tk.VERTICAL)
             self.file_listbox = tk.Listbox(
@@ -1017,6 +1065,18 @@ def launch_gui(terminal_cwd=None):
                        command=self._tvdb_lookup).pack(side=tk.LEFT, padx=(0, 4))
             ttk.Button(list_btn_row, text="Clear Selection",
                        command=self._clear_selection).pack(side=tk.LEFT)
+            # Danger action lives on the right, visually separated from the
+            # benign buttons on the left. Matches --recycle on the find scripts.
+            style.configure('Danger.TButton',
+                background='#5a1f1f', foreground='#ffffff',
+                bordercolor='#7a2a2a', relief='flat', padding=4)
+            style.map('Danger.TButton',
+                background=[('active', '#7a2a2a'), ('pressed', '#3a1414'),
+                            ('disabled', '#3a3a3a')],
+                foreground=[('disabled', '#777777')])
+            ttk.Button(list_btn_row, text="Recycle",
+                       style='Danger.TButton',
+                       command=self._recycle_files).pack(side=tk.RIGHT)
 
             # ── BOTTOM: Progress + Output ────────────────────────────────
             bottom_frame = ttk.Frame(right_pane)
@@ -1048,13 +1108,21 @@ def launch_gui(terminal_cwd=None):
                 foreground='#6a9fd8', anchor=tk.W)
             self.status_label.pack(fill=tk.X, pady=(2, 0))
 
-            # Output text
-            self.output_text = scrolledtext.ScrolledText(
-                bottom_frame, wrap=tk.WORD, font=("Consolas", 9),
+            # Output text — build our own Text + ttk.Scrollbar instead of
+            # scrolledtext.ScrolledText so the scrollbar matches the dark theme
+            # (ScrolledText embeds a classic tk.Scrollbar that ignores ttk style).
+            output_container = ttk.Frame(bottom_frame)
+            output_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=(2, 0))
+            output_scroll = ttk.Scrollbar(output_container, orient=tk.VERTICAL)
+            self.output_text = tk.Text(
+                output_container, wrap=tk.WORD, font=("Consolas", 9),
                 state=tk.DISABLED, bg="#1e1e1e", fg="#cccccc",
-                insertbackground="#cccccc"
+                insertbackground="#cccccc", borderwidth=0,
+                yscrollcommand=output_scroll.set,
             )
-            self.output_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=(2, 0))
+            output_scroll.configure(command=self.output_text.yview)
+            output_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+            self.output_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
             self.output_text.tag_config('keep', foreground='#4ec994')
             self.output_text.tag_config('drop', foreground='#f14c4c')
             self.output_text.tag_config('info', foreground='#9cdcfe')
@@ -1125,6 +1193,61 @@ def launch_gui(terminal_cwd=None):
 
         def _clear_selection(self):
             self.file_listbox.selection_clear(0, tk.END)
+
+        def _recycle_files(self):
+            """Send selected files (or all listed files if none selected) to
+            the recycle bin after an explicit confirmation. Mirrors --recycle
+            on the find scripts but with a safety prompt since in the GUI the
+            list can contain hundreds of items picked via a single scan.
+            """
+            from tkinter import messagebox
+            try:
+                from send2trash import send2trash
+            except ImportError:
+                messagebox.showerror(
+                    "Recycle unavailable",
+                    "send2trash is not installed. Run:\n\n  pip install send2trash",
+                    parent=self.root)
+                return
+
+            files = self._get_selected_files()
+            if not files:
+                self._log("Recycle: nothing to recycle.", 'warn')
+                return
+
+            # Build a preview so the confirmation tells the user what will happen.
+            preview = '\n'.join(f"  • {os.path.basename(p)}" for p in files[:5])
+            more = f"\n  … and {len(files) - 5} more" if len(files) > 5 else ''
+            ok = messagebox.askyesno(
+                "Send to Recycle Bin",
+                f"Send {len(files)} file(s) to the Recycle Bin?\n\n"
+                f"{preview}{more}\n\n"
+                "Files can be restored from the Recycle Bin.",
+                icon='warning', parent=self.root)
+            if not ok:
+                return
+
+            recycled = 0
+            failed = 0
+            for p in files:
+                try:
+                    send2trash(p)
+                    recycled += 1
+                except Exception as e:
+                    failed += 1
+                    self._log(f"  Recycle failed for {os.path.basename(p)}: {e}", 'drop')
+
+            # Rebuild the listbox, dropping any paths that no longer exist.
+            remaining = [p for p in self._file_paths if os.path.exists(p)]
+            self.file_listbox.delete(0, tk.END)
+            self._file_paths = []
+            for p in remaining:
+                self.file_listbox.insert(tk.END, f"  {os.path.basename(p)}")
+                self._file_paths.append(p)
+
+            self._log(f"Recycled {recycled} file(s)" +
+                      (f", {failed} failed" if failed else "") + ".",
+                      'warn' if failed else 'info')
 
         def _set_file_status(self, index, status):
             icons  = {'pending': '  ', 'running': '⟳ ', 'done': '✓ ',
@@ -1327,6 +1450,213 @@ def launch_gui(terminal_cwd=None):
                 except Exception as e:
                     self._log(f"Error building plan for {os.path.basename(f)}: {e}")
 
+        # ── Find toolbar ─────────────────────────────────────────────────
+
+        def _find_scan_root(self):
+            """Return the folder to scan for Find operations, or None."""
+            path = self.path_var.get().strip()
+            if self._multi_drop_active and self._file_paths:
+                # Scan the folder the first dropped file lives in.
+                return os.path.dirname(self._file_paths[0])
+            if os.path.isdir(path):
+                return path
+            if os.path.isfile(path):
+                return os.path.dirname(path)
+            return None
+
+        def _populate_from_results(self, paths, summary_msg):
+            """Replace the file list with an arbitrary set of paths."""
+            self.file_listbox.delete(0, tk.END)
+            self._file_paths = []
+            sentinel = f"[{len(paths)} results]"
+            self._multi_drop_active = True
+            self._multi_drop_sentinel = sentinel
+            self.path_var.set(sentinel)
+            _done_pat = re.compile(r'\[\w+ [\d.]+Mbps \w+\]\.\w+$')
+            for p in paths:
+                self.file_listbox.insert(tk.END, f"  {os.path.basename(p)}")
+                self._file_paths.append(p)
+            for idx, f in enumerate(self._file_paths):
+                if _done_pat.search(os.path.basename(f)):
+                    self._set_file_status(idx, 'done')
+            self._log(summary_msg, 'info')
+
+        def _set_find_enabled(self, enabled):
+            state = tk.NORMAL if enabled else tk.DISABLED
+            for b in self._find_buttons:
+                b.configure(state=state)
+            self.run_btn.configure(state=state)
+
+        def _run_find_scan(self, label, collector_fn):
+            """Run `collector_fn(root, log_fn)` in a worker thread. The
+            collector returns a list of matched paths. label is used in
+            the progress messages.
+            """
+            if self.processing:
+                self._log("Busy — finish the current run first.", 'warn')
+                return
+            root_dir = self._find_scan_root()
+            if not root_dir:
+                self._log(f"Find {label}: set a valid folder or file in Input first.", 'drop')
+                return
+            self._set_find_enabled(False)
+            self._log(f"Find {label}: scanning {root_dir} …", 'info')
+
+            def log_fn(msg, tag=None):
+                self.root.after(0, self._log, msg, tag)
+
+            def worker():
+                try:
+                    results = collector_fn(root_dir, log_fn)
+                except Exception as e:
+                    log_fn(f"Find {label} failed: {e}", 'drop')
+                    results = []
+                def finish():
+                    self._set_find_enabled(True)
+                    if results is None:
+                        return
+                    self._populate_from_results(
+                        results, f"Find {label}: {len(results)} match(es) in {root_dir}")
+                self.root.after(0, finish)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        # Fast, inline-scanning find operations
+
+        _FIND_VIDEO_EXTS = {
+            '.mp4', '.mkv', '.avi', '.mov', '.wmv', '.m4v', '.ts', '.m2ts',
+            '.mpg', '.mpeg', '.flv', '.webm', '.vob', '.divx', '.xvid', '.rmvb',
+        }
+
+        def _find_by_ext(self):
+            ext = simpledialog.askstring(
+                "Find by extension", "Extension (e.g. .ts):",
+                initialvalue=".mpg", parent=self.root)
+            if not ext:
+                return
+            ext = ext if ext.startswith('.') else '.' + ext
+            ext = ext.lower()
+
+            def collect(root, log_fn):
+                out = []
+                for dp, _d, fs in os.walk(root):
+                    for f in fs:
+                        if os.path.splitext(f)[1].lower() == ext:
+                            out.append(os.path.join(dp, f))
+                return sorted(out)
+
+            self._run_find_scan(f"by ext '{ext}'", collect)
+
+        def _find_by_name(self):
+            needle = simpledialog.askstring(
+                "Find by name", "Substring to match in filename:",
+                parent=self.root)
+            if not needle:
+                return
+
+            def collect(root, log_fn):
+                n = needle.lower()
+                out = []
+                for dp, _d, fs in os.walk(root):
+                    for f in fs:
+                        if os.path.splitext(f)[1].lower() not in self._FIND_VIDEO_EXTS:
+                            continue
+                        if n in f.lower():
+                            out.append(os.path.join(dp, f))
+                return sorted(out)
+
+            self._run_find_scan(f"by name '{needle}'", collect)
+
+        def _find_malformed(self):
+            _sxxexx = re.compile(r's\d{1,3}e\d{1,3}', re.IGNORECASE)
+
+            def collect(root, log_fn):
+                out = []
+                for dp, _d, fs in os.walk(root):
+                    for f in fs:
+                        stem, ext = os.path.splitext(f)
+                        if not ext:
+                            out.append(os.path.join(dp, f))
+                        elif ext.lower() in self._FIND_VIDEO_EXTS and not _sxxexx.search(stem):
+                            out.append(os.path.join(dp, f))
+                return sorted(out)
+
+            self._run_find_scan("malformed", collect)
+
+        # Heavier scans delegated to the scripts/ subprocess helpers.
+
+        def _run_script_collector(self, argv, label):
+            """Run a scripts/*.py helper and collect its stdout as paths."""
+            script_py = os.path.join(_SCRIPT_DIR, 'scripts', argv[0])
+            if not os.path.isfile(script_py):
+                raise RuntimeError(f"Missing helper: {argv[0]}")
+            cmd = [sys.executable, script_py] + argv[1:]
+
+            def collect(root, log_fn):
+                full = cmd + [root]
+                proc = subprocess.Popen(
+                    full, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, encoding='utf-8', errors='replace',
+                    creationflags=_NO_WINDOW,
+                )
+                out_lines = []
+                # Stream stderr (progress) to the log; collect stdout as paths.
+                def _pump_stderr():
+                    assert proc.stderr is not None
+                    for line in proc.stderr:
+                        line = line.rstrip()
+                        if line:
+                            log_fn(f"  {line}")
+                t = threading.Thread(target=_pump_stderr, daemon=True)
+                t.start()
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    p = line.strip()
+                    if p and os.path.isfile(p):
+                        out_lines.append(p)
+                proc.wait()
+                t.join(timeout=2)
+                return out_lines
+
+            return self._run_find_scan(label, collect)
+
+        def _find_low_res(self):
+            h = simpledialog.askinteger(
+                "Find low resolution", "Minimum acceptable vertical resolution:",
+                initialvalue=480, minvalue=1, parent=self.root)
+            if not h:
+                return
+            self._run_script_collector(
+                ['check_resolution.py', '--min-height', str(h)],
+                f"resolution < {h}p",
+            )
+
+        def _find_corrupt(self):
+            self._run_script_collector(
+                ['check_corrupt.py'],
+                "corruption scan",
+            )
+
+        def _find_metadata(self):
+            value = simpledialog.askstring(
+                "Find by metadata", "Value substring to match "
+                "(case-insensitive, any key):",
+                initialvalue="Hulu", parent=self.root)
+            if not value:
+                return
+            self._run_script_collector(
+                ['check_metadata.py', '--value', value],
+                f"metadata contains '{value}'",
+            )
+
+        def _open_plex_popup(self):
+            try:
+                from plex_episode_thumbs import build_plex_popup
+            except Exception as e:
+                self._log(f"Could not open Plex popup: {e}", 'drop')
+                return
+            build_plex_popup(self.root)
+
         def _tvdb_lookup(self):
             files = self._get_selected_files()
             if not files:
@@ -1401,6 +1731,7 @@ def launch_gui(terminal_cwd=None):
 
             self.processing = True
             self._stop_flag = False
+            self._ads_cancel = threading.Event()
             self._proc_holder.clear()
             self.run_btn.configure(state=tk.DISABLED)
             self.stop_btn.configure(state=tk.NORMAL)
@@ -1415,6 +1746,7 @@ def launch_gui(terminal_cwd=None):
             keep_suffix = self.keep_suffix_var.get()
             delete_original = self.delete_original_var.get()
             prefer_only = self.prefer_only_var.get()
+            remove_ads = self.remove_ads_var.get() and not dry_run
 
             def print_fn(msg, tag=None):
                 self.root.after(0, self._log, msg, tag)
@@ -1435,9 +1767,64 @@ def launch_gui(terminal_cwd=None):
                         if lb_idx >= 0:
                             self.root.after(0, self._set_file_status, lb_idx, 'running')
 
+                        # Optional ad-removal pass before standardizing. If
+                        # Comskip+VRD produces a _no_ads.mkv we use that as
+                        # the input to process_file instead of the original.
+                        ad_strip_output = None
+                        proc_input = f
+                        if remove_ads:
+                            print_fn(f"  Removing ads: {os.path.basename(f)}…", 'info')
+                            def _ads_status(**kw):
+                                pct = kw.get('pct')
+                                phase = kw.get('phase', '')
+                                if pct is not None and phase:
+                                    self.root.after(
+                                        0, self._update_progress,
+                                        float(pct), i, total)
+                                    self.root.after(
+                                        0, self._update_status,
+                                        f"  {phase}: {pct:.0f}%")
+                            try:
+                                from batch_comskip import strip_ads_one_file
+                                success, out_path, msg = strip_ads_one_file(
+                                    f, log_fn=lambda m: print_fn(f"  {m}"),
+                                    status_fn=_ads_status,
+                                    cancel_event=self._ads_cancel)
+                            except Exception as ads_err:
+                                print_fn(f"  Ad removal failed to start: {ads_err}", 'drop')
+                                success, out_path, msg = False, None, str(ads_err)
+                            if msg == 'canceled':
+                                print_fn("  Ad removal canceled — stopping batch.", 'warn')
+                                self._stop_flag = True
+                                break
+                            if success and out_path and os.path.isfile(out_path):
+                                print_fn(f"  Ads removed: {msg}", 'keep')
+                                # Drop the _no_ads suffix so the standardizer's
+                                # filename builder sees a clean stem (matters
+                                # for files without an SxxExx tag when
+                                # norename is also on).
+                                cleaned = out_path.replace('_no_ads.mkv', '.mkv')
+                                if cleaned != out_path and not os.path.exists(cleaned):
+                                    try:
+                                        os.rename(out_path, cleaned)
+                                        out_path = cleaned
+                                    except Exception:
+                                        pass
+                                ad_strip_output = out_path
+                                proc_input = out_path
+                            elif msg == 'no-ads':
+                                print_fn("  No ads detected — standardizing original.", 'info')
+                            elif msg == 'rejected':
+                                # _validate_ad_strip_output already logged the
+                                # specific reason; just clarify the next step.
+                                print_fn("  Standardizing original instead.", 'info')
+                            else:
+                                print_fn(f"  Ad removal failed ({msg}) — "
+                                         f"standardizing original.", 'warn')
+
                         try:
                             plan = build_file_plan(
-                                f, extension=ext_var, norename=norename,
+                                proc_input, extension=ext_var, norename=norename,
                                 convert_force=force, output_dir=output_dir,
                                 keep_languages=languages, keep_suffix=keep_suffix,
                                 tvdb_changes=self._tvdb_changes.get(f),
@@ -1459,7 +1846,7 @@ def launch_gui(terminal_cwd=None):
                             return _sfn
 
                         result = process_file(
-                            f,
+                            proc_input,
                             extension=ext_var,
                             dry_run=dry_run,
                             rename=rename,
@@ -1479,10 +1866,23 @@ def launch_gui(terminal_cwd=None):
 
                         status = (result or {}).get('status', 'skipped')
                         stats[status] = stats.get(status, 0) + 1
+                        out_file = (result or {}).get('output_file')
+
+                        # When ad-stripping produced an intermediate and the
+                        # standardizer has written a new output, remove the
+                        # intermediate. Skip if the standardizer just renamed
+                        # the intermediate (out_file == ad_strip_output).
+                        if (ad_strip_output and out_file != ad_strip_output
+                                and os.path.exists(ad_strip_output)):
+                            try:
+                                os.remove(ad_strip_output)
+                            except Exception as rm_err:
+                                print_fn(f"  Could not remove {os.path.basename(ad_strip_output)}: "
+                                         f"{rm_err}", 'drop')
 
                         if (status == 'remuxed' and delete_original
                                 and not dry_run
-                                and (result or {}).get('output_file') != f
+                                and out_file != f
                                 and os.path.exists(f)):
                             try:
                                 os.remove(f)
@@ -1522,12 +1922,17 @@ def launch_gui(terminal_cwd=None):
 
         def _stop(self):
             self._stop_flag = True
+            # Kill the ffmpeg child, if any.
             proc = self._proc_holder.get('proc')
             if proc:
                 try:
                     proc.terminate()
                 except Exception:
                     pass
+            # Signal ad-removal to tear down its Comskip + VRD processes.
+            ads_cancel = getattr(self, '_ads_cancel', None)
+            if ads_cancel is not None:
+                ads_cancel.set()
 
         def _processing_done(self):
             self.processing = False

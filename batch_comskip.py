@@ -191,6 +191,23 @@ def _terminate_slot(entry: dict) -> None:
     _cleanup_slot(entry)
 
 
+def cancel_slot(idx: int) -> bool:
+    """Public: force-expire one slot and terminate its processes.
+
+    Used by the GUI Stop button to kill an in-flight Comskip + VRD pair
+    without waiting for the 30-minute watchdog deadline. Returns True if a
+    live slot was terminated, False if the slot had already finished.
+    """
+    with _timeouts_lock:
+        entry = _timeouts.get(idx)
+        if entry is None or entry['expired']:
+            return False
+        entry['expired'] = True
+        snapshot = dict(entry)
+    _terminate_slot(snapshot)
+    return True
+
+
 def _expire_all_slots(reason: str) -> None:
     """Mark every registered slot expired and terminate it.  Called on
     Ctrl-C so any partial output is cleaned up before we exit.
@@ -490,6 +507,184 @@ def _worker(task: tuple) -> tuple:
         # Clean shutdown of our VRD instance.  If ProgramExit blocks (e.g.
         # because the watchdog already killed VRD), we fall through to the
         # taskkill below.  Either way, don't leave an orphan VRD process.
+        if vrd is not None:
+            try:
+                vrd.ProgramExit()
+            except Exception:
+                pass
+        if vrd_pid is not None:
+            _kill_process_tree(vrd_pid)
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+
+_single_file_idx = 100000
+_single_file_idx_lock = threading.Lock()
+
+
+def _probe_duration_seconds(path: str) -> float | None:
+    """Return duration via ffprobe, or None if unavailable."""
+    try:
+        out = subprocess.check_output(
+            ['ffprobe', '-v', 'error', '-show_entries',
+             'format=duration', '-of', 'default=nw=1:nk=1', path],
+            text=True, timeout=30,
+            stderr=subprocess.DEVNULL,
+        )
+        return float(out.strip())
+    except Exception:
+        return None
+
+
+# Reject outputs below this fraction of the original size. Tuned conservatively:
+# a standard 22-minute sitcom cut from a 30-minute slot is ~73% of the source,
+# so 0.40 only triggers on clearly-broken Comskip runs that cut nearly
+# everything.
+_MIN_OUTPUT_SIZE_RATIO = 0.40
+
+
+def _validate_ad_strip_output(output_path: str, orig_bytes: int, new_bytes: int,
+                              *, min_output_seconds: float, log_fn) -> str | None:
+    """Check the cut output against sanity rules. Return None if it passes,
+    or a short human-readable reason if it should be rejected.
+    """
+    if min_output_seconds > 0:
+        dur = _probe_duration_seconds(output_path)
+        if dur is None:
+            return 'output duration unreadable'
+        if dur < min_output_seconds:
+            return (f'output {dur:.0f}s shorter than minimum '
+                    f'{min_output_seconds:.0f}s')
+    # A wildly small file is a near-certain Comskip misdetect even if the
+    # minimum-duration check passes (e.g. produced a sliver we can still
+    # probe). Size check catches that case.
+    if orig_bytes > 0 and new_bytes > 0:
+        ratio = new_bytes / orig_bytes
+        if ratio < _MIN_OUTPUT_SIZE_RATIO:
+            return (f'output only {ratio * 100:.0f}% of source size '
+                    f'(<{_MIN_OUTPUT_SIZE_RATIO * 100:.0f}%)')
+    return None
+
+
+def strip_ads_one_file(path: str, *,
+                       comskip_exe: str = COMSKIP_EXE,
+                       comskip_ini: str = COMSKIP_INI,
+                       log_fn=None,
+                       status_fn=None,
+                       cancel_event=None,
+                       min_output_seconds: float = 20 * 60) -> tuple[bool, str | None, str]:
+    """Run Comskip + VRD on a single file. Callable from any Python context —
+    the GUI uses this to chain ad removal ahead of the standardizer.
+
+    Pass a threading.Event as cancel_event to allow cancellation: when set,
+    the slot's Comskip and VRD processes are killed and partial output is
+    cleaned up.
+
+    min_output_seconds rejects outputs shorter than this many seconds as a
+    safety net against Comskip misdetecting huge spans as commercials.
+    Set to 0 to disable.
+
+    Returns (success, output_path, message):
+      (True,  '<src>_no_ads.mkv', 'ok')       cut + rendered
+      (False, src_path,           'no-ads')   Comskip found nothing to cut
+      (False, src_path,           'rejected') output failed a sanity guard
+      (False, None,               'canceled') user aborted via cancel_event
+      (False, None,               err_msg)    other failure
+    """
+    import pythoncom
+    import win32com.client
+
+    if log_fn is None:
+        def log_fn(msg):
+            pass
+    if status_fn is None:
+        def status_fn(**kw):
+            pass
+
+    with _single_file_idx_lock:
+        global _single_file_idx
+        idx = _single_file_idx
+        _single_file_idx += 1
+
+    _start_watchdog()
+
+    # Cancel watcher — polls the caller's Event and flips the slot to expired,
+    # which makes the real watchdog kill Comskip + VRD and clean up.
+    cancel_stop = threading.Event()
+    if cancel_event is not None:
+        def _cancel_watcher():
+            while not cancel_stop.is_set():
+                if cancel_event.is_set():
+                    cancel_slot(idx)
+                    return
+                cancel_stop.wait(0.25)
+        threading.Thread(target=_cancel_watcher,
+                         name=f'ads-cancel-{idx}',
+                         daemon=True).start()
+
+    stem, _ext  = os.path.splitext(path)
+    out_dir     = os.path.dirname(path)
+    out_stem    = os.path.basename(stem) + '_comskip'
+    temp_output = stem + '_no_ads.mkv'
+
+    _register_timeout(
+        idx, time.monotonic() + FILE_TIMEOUT,
+        source_path=path, out_dir=out_dir, out_stem=out_stem,
+        temp_output=temp_output,
+    )
+
+    pythoncom.CoInitialize()
+    vrd = vrd_silent = None
+    vrd_pid: int | None = None
+    try:
+        with _vrd_dispatch_lock:
+            pids_before = _find_vrd_pids()
+            vrd_silent = win32com.client.Dispatch('VideoReDo6.VideoReDoSilent')
+            vrd = vrd_silent.VRDInterface
+            probe_deadline = time.monotonic() + 6
+            while time.monotonic() < probe_deadline:
+                new_pids = _find_vrd_pids() - pids_before
+                if new_pids:
+                    vrd_pid = next(iter(new_pids))
+                    break
+                time.sleep(0.25)
+        if vrd_pid is not None:
+            _attach_vrd_pid(idx, vrd_pid)
+
+        success, orig_bytes, new_bytes, n_cuts, err = process_file(
+            vrd, path, recycle=False,
+            comskip_exe=comskip_exe, comskip_ini=comskip_ini,
+            status_fn=status_fn, idx=idx,
+            out_dir=out_dir, out_stem=out_stem,
+        )
+        if success:
+            # Sanity guards against Comskip cutting the entire show as ads.
+            rejection = _validate_ad_strip_output(
+                temp_output, orig_bytes, new_bytes,
+                min_output_seconds=min_output_seconds, log_fn=log_fn,
+            )
+            if rejection is not None:
+                try:
+                    os.remove(temp_output)
+                except Exception:
+                    pass
+                log_fn(f'  Ad removal rejected: {rejection} — keeping original.')
+                return False, path, 'rejected'
+            return True, temp_output, f'ok ({n_cuts} cuts)'
+        if err == '':
+            return False, path, 'no-ads'
+        return False, None, err or 'failed'
+    except Exception as exc:
+        if cancel_event is not None and cancel_event.is_set():
+            return False, None, 'canceled'
+        if _is_expired(idx):
+            return False, None, 'Timed out'
+        return False, None, str(exc)
+    finally:
+        cancel_stop.set()
+        _unregister_timeout(idx)
         if vrd is not None:
             try:
                 vrd.ProgramExit()
