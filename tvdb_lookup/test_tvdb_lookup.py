@@ -9,7 +9,7 @@ import os
 import unittest
 from unittest.mock import patch, MagicMock
 
-import tvdb_lookup as tv
+from tvdb_lookup import tvdb_lookup as tv
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Test data: real TVDB episode records (subset)
@@ -812,9 +812,9 @@ class TestEdgeCases(unittest.TestCase):
 
 class TestLookupYearMocked(unittest.TestCase):
 
-    @patch('tvdb_lookup.get_series_episodes')
-    @patch('tvdb_lookup.get_season_types')
-    @patch('tvdb_lookup.find_best_series')
+    @patch('tvdb_lookup.tvdb_lookup.get_series_episodes')
+    @patch('tvdb_lookup.tvdb_lookup.get_season_types')
+    @patch('tvdb_lookup.tvdb_lookup.find_best_series')
     def test_year_found(self, mock_find, mock_types, mock_eps):
         mock_find.return_value = [('12345', 'Dinosaur Train', '2009', 0.95)]
         mock_types.return_value = []
@@ -824,9 +824,9 @@ class TestLookupYearMocked(unittest.TestCase):
         self.assertGreater(result['year_confidence'], 0.5)
         self.assertEqual(result['show_name'], 'Dinosaur Train')
 
-    @patch('tvdb_lookup.get_series_episodes')
-    @patch('tvdb_lookup.get_season_types')
-    @patch('tvdb_lookup.find_best_series')
+    @patch('tvdb_lookup.tvdb_lookup.get_series_episodes')
+    @patch('tvdb_lookup.tvdb_lookup.get_season_types')
+    @patch('tvdb_lookup.tvdb_lookup.find_best_series')
     def test_year_low_confidence(self, mock_find, mock_types, mock_eps):
         mock_find.return_value = [('12345', 'Wrong Show', '2020', 0.3)]
         mock_types.return_value = []
@@ -834,7 +834,7 @@ class TestLookupYearMocked(unittest.TestCase):
         result = tv.lookup_all(r'F:\Downloads\Dinosaur Train\episode.avi')
         self.assertIsNone(result['year'])
 
-    @patch('tvdb_lookup.find_best_series')
+    @patch('tvdb_lookup.tvdb_lookup.find_best_series')
     def test_year_no_results(self, mock_find):
         mock_find.return_value = []
         result = tv.lookup_all(r'F:\Downloads\Dinosaur Train\episode.avi')
@@ -843,9 +843,9 @@ class TestLookupYearMocked(unittest.TestCase):
 
 class TestLookupEpisodeIdMocked(unittest.TestCase):
 
-    @patch('tvdb_lookup.get_series_episodes')
-    @patch('tvdb_lookup.get_season_types')
-    @patch('tvdb_lookup.find_best_series')
+    @patch('tvdb_lookup.tvdb_lookup.get_series_episodes')
+    @patch('tvdb_lookup.tvdb_lookup.get_season_types')
+    @patch('tvdb_lookup.tvdb_lookup.find_best_series')
     def test_dual_segment_dinosaur_train(self, mock_find, mock_types, mock_eps):
         mock_find.return_value = [('116291', 'Dinosaur Train', '2009', 0.95)]
         mock_types.return_value = [{'type': 'default', 'name': 'Aired Order'}]
@@ -859,9 +859,9 @@ class TestLookupEpisodeIdMocked(unittest.TestCase):
         self.assertEqual(aired['tag'], 'S01E11E12')
         self.assertGreater(aired['match_score'], 0.5)
 
-    @patch('tvdb_lookup.get_series_episodes')
-    @patch('tvdb_lookup.get_season_types')
-    @patch('tvdb_lookup.find_best_series')
+    @patch('tvdb_lookup.tvdb_lookup.get_series_episodes')
+    @patch('tvdb_lookup.tvdb_lookup.get_season_types')
+    @patch('tvdb_lookup.tvdb_lookup.find_best_series')
     def test_single_episode_dinosaur_train(self, mock_find, mock_types, mock_eps):
         mock_find.return_value = [('116291', 'Dinosaur Train', '2009', 0.95)]
         mock_types.return_value = [{'type': 'default', 'name': 'Aired Order'}]
@@ -874,9 +874,9 @@ class TestLookupEpisodeIdMocked(unittest.TestCase):
         self.assertIsNotNone(aired)
         self.assertEqual(aired['tag'], 'S01E74')
 
-    @patch('tvdb_lookup.get_series_episodes')
-    @patch('tvdb_lookup.get_season_types')
-    @patch('tvdb_lookup.find_best_series')
+    @patch('tvdb_lookup.tvdb_lookup.get_series_episodes')
+    @patch('tvdb_lookup.tvdb_lookup.get_season_types')
+    @patch('tvdb_lookup.tvdb_lookup.find_best_series')
     def test_paw_patrol_with_sxxexx(self, mock_find, mock_types, mock_eps):
         mock_find.return_value = [('272472', 'PAW Patrol', '2013', 0.90)]
         mock_types.return_value = [{'type': 'default', 'name': 'Aired Order'}]
@@ -889,9 +889,9 @@ class TestLookupEpisodeIdMocked(unittest.TestCase):
         self.assertIsNotNone(aired)
         self.assertEqual(aired['tag'], 'S01E07E08')
 
-    @patch('tvdb_lookup.get_series_episodes')
-    @patch('tvdb_lookup.get_season_types')
-    @patch('tvdb_lookup.find_best_series')
+    @patch('tvdb_lookup.tvdb_lookup.get_series_episodes')
+    @patch('tvdb_lookup.tvdb_lookup.get_season_types')
+    @patch('tvdb_lookup.tvdb_lookup.find_best_series')
     def test_paw_patrol_christmas_renumbered(self, mock_find, mock_types, mock_eps):
         """File says S01E20 but TVDB has Christmas as S01E32."""
         mock_find.return_value = [('272472', 'PAW Patrol', '2013', 0.90)]
@@ -905,9 +905,9 @@ class TestLookupEpisodeIdMocked(unittest.TestCase):
         self.assertIsNotNone(aired)
         self.assertEqual(aired['tag'], 'S01E32')
 
-    @patch('tvdb_lookup.get_series_episodes')
-    @patch('tvdb_lookup.get_season_types')
-    @patch('tvdb_lookup.find_best_series')
+    @patch('tvdb_lookup.tvdb_lookup.get_series_episodes')
+    @patch('tvdb_lookup.tvdb_lookup.get_season_types')
+    @patch('tvdb_lookup.tvdb_lookup.find_best_series')
     def test_query_title_passed_through(self, mock_find, mock_types, mock_eps):
         mock_find.return_value = [('116291', 'Dinosaur Train', '2009', 0.95)]
         mock_types.return_value = [{'type': 'default', 'name': 'Aired Order'}]
@@ -921,9 +921,9 @@ class TestLookupEpisodeIdMocked(unittest.TestCase):
 
 class TestLookupEpisodeTitleMocked(unittest.TestCase):
 
-    @patch('tvdb_lookup.get_series_episodes')
-    @patch('tvdb_lookup.get_season_types')
-    @patch('tvdb_lookup.find_best_series')
+    @patch('tvdb_lookup.tvdb_lookup.get_series_episodes')
+    @patch('tvdb_lookup.tvdb_lookup.get_season_types')
+    @patch('tvdb_lookup.tvdb_lookup.find_best_series')
     def test_single_episode_title(self, mock_find, mock_types, mock_eps):
         mock_find.return_value = [('272472', 'PAW Patrol', '2013', 0.90)]
         mock_types.return_value = [{'type': 'default', 'name': 'Aired Order'}]
@@ -937,9 +937,9 @@ class TestLookupEpisodeTitleMocked(unittest.TestCase):
         self.assertEqual(len(aired), 1)
         self.assertEqual(aired[0][2], 'Pups and the Ghost Pirate')
 
-    @patch('tvdb_lookup.get_series_episodes')
-    @patch('tvdb_lookup.get_season_types')
-    @patch('tvdb_lookup.find_best_series')
+    @patch('tvdb_lookup.tvdb_lookup.get_series_episodes')
+    @patch('tvdb_lookup.tvdb_lookup.get_season_types')
+    @patch('tvdb_lookup.tvdb_lookup.find_best_series')
     def test_multi_episode_titles(self, mock_find, mock_types, mock_eps):
         mock_find.return_value = [('272472', 'PAW Patrol', '2013', 0.90)]
         mock_types.return_value = [{'type': 'default', 'name': 'Aired Order'}]
@@ -953,7 +953,7 @@ class TestLookupEpisodeTitleMocked(unittest.TestCase):
         self.assertEqual(aired[0][2], 'Pups Make a Splash')
         self.assertEqual(aired[1][2], 'Pups Fall Festival')
 
-    @patch('tvdb_lookup.find_best_series')
+    @patch('tvdb_lookup.tvdb_lookup.find_best_series')
     def test_no_sxxexx_returns_none(self, mock_find):
         mock_find.return_value = []
         fp = r'F:\Shows\episode without sxxexx.avi'
@@ -967,7 +967,7 @@ class TestLookupEpisodeTitleMocked(unittest.TestCase):
 
 class TestFindBestSeries(unittest.TestCase):
 
-    @patch('tvdb_lookup.search_series')
+    @patch('tvdb_lookup.tvdb_lookup.search_series')
     def test_exact_match_first(self, mock_search):
         mock_search.return_value = [
             {'name': 'Dinosaur Train', 'year': '2009', 'tvdb_id': '116291'},
@@ -977,13 +977,13 @@ class TestFindBestSeries(unittest.TestCase):
         self.assertEqual(results[0][0], '116291')
         self.assertGreater(results[0][3], results[1][3])
 
-    @patch('tvdb_lookup.search_series')
+    @patch('tvdb_lookup.tvdb_lookup.search_series')
     def test_empty_results(self, mock_search):
         mock_search.return_value = []
         results = tv.find_best_series('Nonexistent Show')
         self.assertEqual(results, [])
 
-    @patch('tvdb_lookup.search_series')
+    @patch('tvdb_lookup.tvdb_lookup.search_series')
     def test_paw_patrol_match(self, mock_search):
         mock_search.return_value = [
             {'name': 'PAW Patrol', 'year': '2013', 'tvdb_id': '272472'},

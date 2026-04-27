@@ -7,17 +7,17 @@ The repository also ships companion tools for **commercial removal** (Comskip + 
 ## Contents
 
 - [Feature overview](#feature-overview)
-- [Requirements](#requirements)
-- [Configuration (`config.env`)](#configuration-configenv)
-- [Video Standardizer](#video-standardizer-1)
+- [Setup](#setup)
+- [Video Standardizer](#video-standardizer-1) (root project)
   - [GUI](#gui)
   - [CLI](#cli)
   - [Options](#options)
   - [How it works](#how-it-works)
-- [TVDB Lookup](#tvdb-lookup)
-- [Commercial Removal](#commercial-removal-comskip--videoredo)
-- [Plex Episode Thumbnails](#plex-episode-thumbnails)
-- [Unblend Telecine](#unblend-telecine)
+- Subprojects:
+  - [`tvdb_lookup/`](#tvdb-lookup) — TVDB metadata enrichment
+  - [`commercial_skip/`](#commercial-skip-comskip--videoredo) — Comskip + VideoReDo ad removal
+  - [`plex_integration/`](#plex-integration) — Plex episode thumbnails
+  - [`frame_dedupe/`](#frame-dedupe-telecine-restore) — 30→24fps telecine restore
 - [Library Maintenance Scripts](#library-maintenance-scripts)
 - [License](#license)
 
@@ -26,10 +26,10 @@ The repository also ships companion tools for **commercial removal** (Comskip + 
 | Tool | Entry point | GUI | CLI |
 |------|-------------|-----|-----|
 | Video Standardizer (remux + rename + tag) | [`video_standardizer.py`](video_standardizer.py) / [`video_standardizer.pyw`](video_standardizer.pyw) | ✅ | ✅ |
-| TVDB metadata enrichment (year / SxxExx / title) | [`tvdb_lookup.py`](tvdb_lookup.py) | ✅ popup | via standardizer |
-| Commercial detection + smart-render removal | [`batch_comskip.py`](batch_comskip.py) | ✅ as a Run option | ✅ |
-| Plex episode thumbnails from frame at N% | [`plex_episode_thumbs.py`](plex_episode_thumbs.py) | ✅ menu → popup | ✅ |
-| Reverse 5:4 weighted-blend pulldown (30→24fps) | [`unblend_telecine.py`](unblend_telecine.py) | — | ✅ |
+| TVDB metadata enrichment (year / SxxExx / title) | [`tvdb_lookup/tvdb_lookup.py`](tvdb_lookup/tvdb_lookup.py) | ✅ popup | via standardizer |
+| Commercial detection + smart-render removal | [`commercial_skip/batch_comskip.py`](commercial_skip/batch_comskip.py) | ✅ as a Run option | ✅ |
+| Plex episode thumbnails from frame at N% | [`plex_integration/plex_episode_thumbs.py`](plex_integration/plex_episode_thumbs.py) | ✅ menu → popup | ✅ |
+| Reverse 30→24fps telecine (unblend or dedupe) | [`frame_dedupe/restore.py`](frame_dedupe/restore.py) | — | ✅ |
 | Find files by extension | [`scripts/find_by_ext.py`](scripts/find_by_ext.py) | ✅ Find toolbar | ✅ |
 | Find files by filename substring | [`scripts/find_by_name.py`](scripts/find_by_name.py) | ✅ Find toolbar | ✅ |
 | Find malformed filenames (no `SxxExx` or no extension) | [`scripts/find_malformed.py`](scripts/find_malformed.py) | ✅ Find toolbar | ✅ |
@@ -39,31 +39,34 @@ The repository also ships companion tools for **commercial removal** (Comskip + 
 | Recycle selected files | `send2trash` | ✅ Recycle button (with confirm) | via `--recycle` on find scripts |
 | Remove empty directories | [`scripts/remove_empty_dirs.py`](scripts/remove_empty_dirs.py) | — | ✅ |
 
-## Requirements
+## Setup
+
+### Core requirements
 
 - **Python 3.8+**
-- **[FFmpeg](https://ffmpeg.org/download.html)** — both `ffmpeg` and `ffprobe` on your `PATH`. Required by the standardizer, Plex thumbnails, and most scan scripts.
-- **[Comskip](https://www.comskip.org/)** — required by `batch_comskip.py`. A `comskip.exe` and `comskip.ini` are expected in [comskip_dst/](comskip_dst/) by default (override with `--comskip` / `--comskip-ini`).
-- **[VideoReDo TVSuite v6](https://www.videoredo.com/)** — required by `batch_comskip.py`. The driver talks to its `VideoReDo6.VideoReDoSilent` COM interface (Windows only).
-- **Plex Media Server** (local) — required by `plex_episode_thumbs.py`. The script must run on a machine that can read the library files directly.
-- **[VapourSynth](https://www.vapoursynth.com/)** R65+ with the **lsmas** plugin — required by `unblend_telecine.py`. Install the official Windows installer (it ships with `vsrepo`), then `vsrepo.py install lsmas`. The repo's local `.venv\Scripts\vspipe.exe` is used automatically when present; otherwise `vspipe` is expected on `PATH`.
+- **[FFmpeg](https://ffmpeg.org/download.html)** — both `ffmpeg` and `ffprobe` on your `PATH`.
 
 ### Python dependencies
 
-| Package | Purpose | Required by |
-|---------|---------|-------------|
-| [`tkinterdnd2`](https://pypi.org/project/tkinterdnd2/) | Drag-and-drop files/folders onto the standardizer GUI input | Standardizer GUI |
-| [`rich`](https://pypi.org/project/rich/) | Live batch dashboard | `batch_comskip.py` |
-| [`pywin32`](https://pypi.org/project/pywin32/) | Drives the VideoReDo silent COM interface | `batch_comskip.py` |
-| [`send2trash`](https://pypi.org/project/Send2Trash/) | Recycle-bin deletes | `batch_comskip.py` (with `--recycle`), `scripts/check_corrupt.py`, `scripts/check_metadata.py`, `scripts/check_resolution.py`, `scripts/remove_empty_dirs.py` |
-
 ```
-pip install tkinterdnd2 rich pywin32 send2trash
+pip install tkinterdnd2 rich pywin32 send2trash numpy vapoursynth
 ```
 
-No installation step beyond that — clone the repo and run the scripts directly.
+The full list (`tkinterdnd2`, `rich`, `pywin32`, `send2trash`, `numpy`, `vapoursynth`) covers every subproject — drag-and-drop in the GUI, the Comskip Rich dashboard, the VideoReDo COM driver, recycle-bin deletes, and the cadence detector / pipeline in [frame_dedupe](frame_dedupe/). After this one command you can run any script in the repo directly.
 
-## Configuration (`config.env`)
+### Per-subproject native dependencies
+
+Each subproject has its own optional native deps. Missing items don't break the rest of the project — controls in the GUI that depend on them are automatically grayed out at startup, with a tooltip explaining why.
+
+| Subproject | Native dependency | Notes |
+|------------|-------------------|-------|
+| [Video Standardizer](#video-standardizer) (root) | ffmpeg, ffprobe | Already covered above; the rest of the repo also depends on these. |
+| [`frame_dedupe/`](frame_dedupe/) | [VapourSynth](https://www.vapoursynth.com/) R65+ with the **lsmas** plugin | Install the official Windows installer (ships with `vsrepo`), then `vsrepo.py install lsmas`. The repo's local `.venv\Scripts\vspipe.exe` is used automatically when present; otherwise `vspipe` is expected on `PATH`. |
+| [`commercial_skip/`](commercial_skip/) | [Comskip](https://www.comskip.org/) executable + [VideoReDo TVSuite v6](https://www.videoredo.com/) | Comskip lives in [comskip_dst/](comskip_dst/) at the repo root (`comskip.exe` + `comskip.ini`). VideoReDo is reached via its `VideoReDo6.VideoReDoSilent` COM interface (Windows only). |
+| [`plex_integration/`](plex_integration/) | Plex Media Server (local) | The script must run on a machine that can read the library files directly. |
+| [`tvdb_lookup/`](tvdb_lookup/) | TVDB v4 API key | Free at [thetvdb.com](https://thetvdb.com) → **API Access**. Stored in `config.env` (see below). |
+
+### Configuration (`config.env`)
 
 All tools that need credentials read them from a single `config.env` file in the repo root. Create it by hand:
 
@@ -75,9 +78,9 @@ plex_url=http://127.0.0.1:32400
 
 | Key | Used by | Notes |
 |-----|---------|-------|
-| `apikey` | `tvdb_lookup.py` (TVDB popup) | Free key from [thetvdb.com](https://thetvdb.com) under **API Access**. Responses are cached locally in `tvdb_cache.json`. |
-| `plex_token` | `plex_episode_thumbs.py` | [How to find yours.](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/) Can also be passed as `--token`. |
-| `plex_url` | `plex_episode_thumbs.py` | Optional; defaults to `http://127.0.0.1:32400`. |
+| `apikey` | [`tvdb_lookup/`](tvdb_lookup/) (TVDB popup) | Free key from [thetvdb.com](https://thetvdb.com) under **API Access**. Responses are cached locally in `tvdb_cache.json` at the repo root. |
+| `plex_token` | [`plex_integration/`](plex_integration/) | [How to find yours.](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/) Can also be passed as `--token`. |
+| `plex_url` | [`plex_integration/`](plex_integration/) | Optional; defaults to `http://127.0.0.1:32400`. |
 
 Each tool runs fine without the keys it doesn't need.
 
@@ -152,7 +155,7 @@ CLI and GUI expose equivalent settings. Flags marked GUI-only are surfaced as ch
 | `-d` / `--dry-run` | **Dry Run** | Preview only — no files are written |
 | `-v` / `--verbose` | **Verbose Output** | Print the `ffmpeg` command and live progress stats |
 | — | **Delete Original After Re-process** | Remove the source file after a successful remux |
-| — | **Remove Ads First (Comskip + VideoReDo)** | For each file, run [Commercial Removal](#commercial-removal-comskip--videoredo) first and feed the cut result into the standardizer. The intermediate `_no_ads.mkv` is deleted after the standardizer writes its final output. Disabled during dry runs. Requires Comskip, VideoReDo, and `pywin32`. The cut output is rejected and the original is kept whenever it falls below a minimum duration (default 20 min) or shrinks to under 40% of the source size — both are signs that Comskip misidentified a chunk of the show as commercials. Clicking **Stop** mid-run force-kills the running Comskip and VideoReDo processes and ends the batch. |
+| — | **Remove Ads First (Comskip + VideoReDo)** | For each file, run [Commercial Removal](#commercial-skip-comskip--videoredo) first and feed the cut result into the standardizer. The intermediate `_no_ads.mkv` is deleted after the standardizer writes its final output. Disabled during dry runs. Auto-grayed out if Comskip or VideoReDo is missing. The cut output is rejected and the original is kept whenever it falls below a minimum duration (default 20 min) or shrinks to under 40% of the source size — both are signs that Comskip misidentified a chunk of the show as commercials. Clicking **Stop** mid-run force-kills the running Comskip and VideoReDo processes and ends the batch. |
 
 ### How it works
 
@@ -168,7 +171,7 @@ MKV supports a broad range of subtitle formats (SRT, ASS, PGS, VobSub, DVB, WebV
 
 ## TVDB Lookup
 
-The **TVDB Lookup** button in the main window opens a popup that queries [TheTVDB](https://thetvdb.com) for all selected files at once. Three enrichment modes, independently toggleable:
+The [`tvdb_lookup/`](tvdb_lookup/) subproject queries TheTVDB to enrich filenames. The **TVDB Lookup** button in the main window opens a popup that queries [TheTVDB](https://thetvdb.com) for all selected files at once. Three enrichment modes, independently toggleable:
 
 - **Year** — inserts the series premiere year as `(YYYY)` before the `[HD …]` tag.
 - **Episode ID** — fuzzy-matches the filename's episode title against TVDB to derive the correct `SxxExx`.
@@ -178,36 +181,44 @@ TVDB supports multiple ordering schemes per series (Aired, DVD, Absolute, …). 
 
 **Workflow:** select files → **TVDB Lookup** → pick modes and ordering → deselect unwanted rows → **Apply** → **Show Plan** or **Run**. Applied changes persist for the session.
 
-Requires `apikey=` in `config.env`.
+**Native deps:** `apikey=` in `config.env`. The button is automatically grayed out at startup if the key is missing, with a tooltip explaining what to do.
+
+Tests live alongside the module and run from the repo root:
+
+```
+python -m unittest tvdb_lookup.test_tvdb_lookup
+```
 
 ## Commercial Removal (Comskip + VideoReDo)
 
-The standardizer GUI exposes this as a per-run **Remove Ads First** checkbox (see [GUI Options](#options)) — cut once, standardize once, intermediate deleted automatically. The CLI entry point below is still the way to do bulk parallel ad-removal without running the standardizer afterward.
+The [`commercial_skip/`](commercial_skip/) subproject runs Comskip + VideoReDo to strip ads. The standardizer GUI exposes it as a per-run **Remove Ads First** checkbox (see [GUI Options](#options)) — cut once, standardize once, intermediate deleted automatically. The CLI entry point below is still the way to do bulk parallel ad-removal without running the standardizer afterward.
 
-[`batch_comskip.py`](batch_comskip.py) walks a folder (or reads paths from stdin), runs Comskip on each video to detect ad regions, then hands the resulting `.VPrj` to a silent VideoReDo instance which **smart-renders** (no re-encode) the source minus the cut regions. Output is written next to the source as `<stem>_no_ads.mkv`.
+[`commercial_skip/batch_comskip.py`](commercial_skip/batch_comskip.py) walks a folder (or reads paths from stdin), runs Comskip on each video to detect ad regions, then hands the resulting `.VPrj` to a silent VideoReDo instance which **smart-renders** (no re-encode) the source minus the cut regions. Output is written next to the source as `<stem>_no_ads.mkv`.
 
 A live Rich dashboard shows per-file phase, percent, and elapsed time.
 
-[`batch_vrd_save.py`](batch_vrd_save.py) is the shared library: VideoReDo save pipeline, live dashboard, and video discovery helpers. Not a standalone entry point.
+[`commercial_skip/batch_vrd_save.py`](commercial_skip/batch_vrd_save.py) is the shared library: VideoReDo save pipeline, live dashboard, and video discovery helpers. Not a standalone entry point.
+
+**Native deps:** Comskip executable in [`comskip_dst/`](comskip_dst/) at the repo root, VideoReDo TVSuite v6 with its COM interface registered (Windows only).
 
 ### Usage
 
 Process every video in a folder:
 
 ```
-python batch_comskip.py "C:\Recorded TV"
+python commercial_skip/batch_comskip.py "C:\Recorded TV"
 ```
 
 Process a piped list of paths (one per line):
 
 ```
-python scripts/find_by_ext.py "C:\Recorded TV" --ext .ts | python batch_comskip.py -
+python scripts/find_by_ext.py "C:\Recorded TV" --ext .ts | python commercial_skip/batch_comskip.py -
 ```
 
 Replace originals with the cleaned output (originals go to the recycle bin):
 
 ```
-python batch_comskip.py "C:\Recorded TV" --recycle
+python commercial_skip/batch_comskip.py "C:\Recorded TV" --recycle
 ```
 
 ### Options
@@ -229,16 +240,20 @@ Behaviour:
 - Ctrl+C signals a graceful stop: active workers finish their current file; no new files start.
 - **Sanity guards** (GUI only, today) reject cut outputs that look obviously wrong: shorter than 20 minutes, or less than 40% of the source file size. When a guard fires, the `_no_ads.mkv` is deleted and the original is kept.
 
-## Plex Episode Thumbnails
+## Plex Integration
 
-[`plex_episode_thumbs.py`](plex_episode_thumbs.py) grabs a frame from N% into every episode of a given show/season and uploads it as the Plex thumbnail. Useful when Plex has generated poor auto-thumbs (e.g. a title card or black frame).
+The [`plex_integration/`](plex_integration/) subproject covers Plex-server-facing features.
+
+### Episode Thumbnails
+
+[`plex_integration/plex_episode_thumbs.py`](plex_integration/plex_episode_thumbs.py) grabs a frame from N% into every episode of a given show/season and uploads it as the Plex thumbnail. Useful when Plex has generated poor auto-thumbs (e.g. a title card or black frame).
 
 From the GUI: **Tools → Plex Thumbnails…** opens a popup that queries your Plex server, populates a show dropdown and a season dropdown, and runs the same apply logic as the CLI. Results stream into the popup's log panel. Cancelable mid-run.
 
 ```
-python plex_episode_thumbs.py "Firefly" 1
-python plex_episode_thumbs.py "Arthur" --all --percent 15
-python plex_episode_thumbs.py "Firefly" 1 --dry-run
+python plex_integration/plex_episode_thumbs.py "Firefly" 1
+python plex_integration/plex_episode_thumbs.py "Arthur" --all --percent 15
+python plex_integration/plex_episode_thumbs.py "Firefly" 1 --dry-run
 ```
 
 | Argument / flag | Description |
@@ -256,11 +271,15 @@ Requires `plex_token=` in `config.env`. Uses system `ffmpeg` to extract frames a
 - **Black-frame avoidance.** The chosen timestamp is probed with `blackdetect` over a short window. If it lands inside a black region (opening title, scene transition, post-ad fade), the script steps forward 5 seconds and re-probes, up to 5 attempts, until it finds a non-black frame.
 - **Letterbox auto-crop.** `cropdetect` runs on the same probe window; if it reports a sub-frame region (e.g. 4:3 content inside a 16:9 source), the final extract applies a matching `crop` filter so the thumbnail is just the picture, not the bars.
 
-## Unblend Telecine
+## Frame Dedupe (telecine restore)
 
-[`unblend_telecine.py`](unblend_telecine.py) reverses a particular kind of bad NTSC pulldown found on some old DVD rips: a 24fps film source was upconverted to 30fps using a **5:4 weighted-blend pulldown** that produces three clean frames followed by two interlaced frames per cadence group. Standard inverse-telecine tools (`fieldmatch`, ffmpeg `decimate`) and motion-compensated deinterlacers (QTGMC) both fail on this pattern because the interlaced frames don't have clean integer-row field boundaries — they were resized vertically *after* the interlacing was applied.
+[`frame_dedupe/restore.py`](frame_dedupe/restore.py) reverses two specific 30→24fps telecine patterns found on poorly-converted DVD rips and broadcast captures. Both patterns are common when 24fps film is converted to 30fps for NTSC distribution. Each output is at 23.976fps with source audio passed through.
 
-The fix is purely algebraic. For each 5-frame cadence group:
+Two modes, picked via `--mode`:
+
+### Mode 1: `unblend` — 5:4 weighted-blend pulldown
+
+The source has 3 clean frames followed by 2 interlaced frames per cadence group of 5:
 
 ```
 s[0]: F_a clean       (passthrough)
@@ -270,30 +289,47 @@ s[3]: 0.5*F_c + 0.5*F_d  (interlaced)
 s[4]: 0.5*F_d + 0.5*F_e  (interlaced; F_e is the next group's F_a)
 ```
 
-The missing F_d is reconstructed as `F_d = b1 + b2 − 0.5*F_c − 0.5*F_e`. Output: `[F_a, F_b, F_c, F_d_recovered]` per group at 23.976fps. Three of the four output frames are bit-exact source pixels.
+Standard inverse-telecine tools (`fieldmatch`, ffmpeg `decimate`) and motion-compensated deinterlacers (QTGMC) both fail on this pattern because the interlaced frames don't have clean integer-row field boundaries — they were resized vertically *after* the interlacing was applied. The fix is purely algebraic: `F_d = b1 + b2 − 0.5*F_c − 0.5*F_e`. Output: `[F_a, F_b, F_c, F_d_recovered]` per group. Three of the four output frames are bit-exact source pixels; the recovered F_d retains horizontal comb stripes from the staggered field sampling.
 
-**Use case.** This tool is targeted at preparing degraded sources for AI upscalers like **Topaz Video AI / Proteus**. The reconstructed F_d frames will retain horizontal comb stripes from the staggered field sampling — this is intentional. AI upscalers trained on broad degradation produce sharper, more accurate output when fed slightly-flawed-but-crisp frames than when fed pre-deinterlaced softened frames. Let the upscaler's deinterlace settings clean up the residual combs as part of the upscale pass.
+**Use case.** Preparing degraded sources for AI upscalers like **Topaz Video AI / Proteus**. The retained comb stripes are intentional — AI upscalers produce sharper output when fed slightly-flawed-but-crisp frames than when fed pre-deinterlaced softened frames. Let the upscaler's deinterlace settings clean up residual combs as part of the upscale pass.
 
-**Requirements:** VapourSynth R65+, the `lsmas` plugin, and `ffmpeg` on `PATH`.
+### Mode 2: `dedupe` — duplicate-frame pulldown
+
+The source has 4 unique frames plus 1 duplicate per group of 5 (no blending):
+
+```
+Phase 0: [A, A, B, C, D]  → keep [A, B, C, D]
+Phase 1: [A, B, B, C, D]  → keep [A, B, C, D]
+Phase 2: [A, B, C, C, D]  → keep [A, B, C, D]
+Phase 3: [A, B, C, D, D]  → keep [A, B, C, D]
+```
+
+The fix is a simple SelectEvery that drops the second frame of each duplicate pair. Because compressed sources aren't pixel-perfect, duplicates are detected by the adjacent-pair position with consistently lowest mean-absolute-difference (MAD).
+
+### Auto-detected per-segment phase
+
+Scene cuts in edited sources reset the cadence to a different phase. By default, the tool auto-detects per-segment phase by sampling overlapping 50-frame windows across the entire file (using a parallel process pool). Each segment is then transformed with its own phase. For unedited sources with truly uniform cadence — rare in practice — pass `--phase N` to skip detection.
 
 ### Usage
 
-Auto-detect cadence and render to ProRes 422 next to the source:
+Auto-detect and render to ProRes 422 next to the source:
 
 ```
-python unblend_telecine.py -i "movie.mp4" --audio
+python frame_dedupe/restore.py -i "movie.mp4" --mode unblend
+python frame_dedupe/restore.py -i "movie.mp4" --mode dedupe
 ```
 
 Quick H.264 preview at a specific timestamp:
 
 ```
-python unblend_telecine.py -i "movie.mp4" --codec h264 --start 12:30 --duration 5:00
+python frame_dedupe/restore.py -i "movie.mp4" --mode unblend \
+    --codec h264 --start 12:30 --duration 5:00
 ```
 
-Reuse a previously-detected segment list (skips the detection pass):
+Force a single phase across the whole file (uniform cadence only):
 
 ```
-python unblend_telecine.py -i "movie.mp4" --load-segments segments.json --audio
+python frame_dedupe/restore.py -i "movie.mp4" --mode dedupe --phase 3
 ```
 
 ### Options
@@ -301,34 +337,38 @@ python unblend_telecine.py -i "movie.mp4" --load-segments segments.json --audio
 | Flag | Description |
 |------|-------------|
 | `-i FILE` / `--input` | Source video file (required). |
-| `-o FILE` / `--output` | Output video file. **Default**: `<input_stem> [unblended]<ext>` next to the source (`.mov` for ProRes, `.mp4` for H.264). |
-| `--phase {0..4}` | Force a single global phase (skips auto-detect). Use only on sources you know have uniform cadence — most edited material does not. |
-| `--start TC` | Start time as `HH:MM:SS`, `MM:SS`, or seconds. Default: file start. |
-| `--duration TC` | Duration as `HH:MM:SS`, `MM:SS`, or seconds. Default: rest of file. |
-| `--codec {prores,prores_hq,h264}` | `prores` = ProRes 422 (recommended for AI upscaler input); `prores_hq` = higher bitrate ProRes 422 HQ; `h264` = libx264 CRF 18 for quick test renders. Default `prores`. |
-| `--audio` | Mux source audio with the trim offset applied. |
-| `--threads N` | Parallel worker processes for cadence detection. Default 8. Each worker opens its own decoder, so the speedup is real (no GIL contention). |
-| `--save-segments PATH` | Write the detected segments JSON to `PATH` so it can be reused with `--load-segments`. |
-| `--load-segments PATH` | Skip detection and load segments from a previous JSON. Useful for re-rendering with a different codec or trim window without paying the detection cost. |
-| `--dry-run` | Print the generated VapourSynth script and ffmpeg command without rendering. |
+| `--mode {unblend,dedupe}` | Cadence model to reverse (required). See descriptions above. |
+| `-o FILE` / `--output` | Output file. Default: `<input_stem> [<mode>]<ext>` next to source (`.mov` for ProRes, `.mp4` for H.264). |
+| `--phase {0..4}` | Force a single global phase (skips auto-detect). Use only when source cadence is uniform. |
+| `--start TC` | Start time (`HH:MM:SS` / `MM:SS` / seconds). Default: file start. |
+| `--duration TC` | Duration (`HH:MM:SS` / `MM:SS` / seconds). Default: rest of file. |
+| `--codec {prores,prores_hq,h264}` | `prores` = ProRes 422 (default; recommended for AI upscaler input); `prores_hq` = higher bitrate ProRes 422 HQ; `h264` = libx264 CRF 18 for test renders. |
+| `--threads N` | Parallel worker processes for detection. Default `cpu_count - 8`. Each worker opens its own decoder, so the speedup is real. |
+| `--dry-run` | Print segments and the generated `.vpy` without rendering. |
 
-### Cadence and phase tracking
+Source audio is always passed through (with the trim offset applied if `--start` / `--duration` are set).
 
-Scene cuts in edited sources reset the 5:4 cadence to a different phase. By default, the script auto-detects per-segment phase: it samples 50-frame windows across the file, identifies which two positions per cycle of 5 are interlaced (high adjacent-row variance on motion regions), maps that to the source-absolute phase, smooths out single-window noise, and emits a list of `(start_frame, end_frame, phase)` segments. Each segment is then unblended with its own phase.
+### Two stages of progress
 
-Two stages of progress are printed:
-1. `Detecting cadence: frames [0, 175040), window=50, stride=25, threads=8` followed by `5%, 10%, ...` — the detection pass (typically ~3 minutes for a 2-hour movie at default settings).
-2. `Rendering 140032 frames (5840s @ 23.976fps)...` followed by per-percent render progress — the actual encode.
+1. `Detecting unblend cadence: frames [0, 175040), window=50, stride=25, threads=24` followed by per-worker progress — the detection pass (typically a few minutes for a 2-hour movie at default settings).
+2. `Rendering 140032 frames (5840s @ 23.976fps)...` followed by per-percent render progress — the actual encode (much faster than detection).
 
-For unedited sources with truly uniform cadence (rare), `--phase N` skips detection entirely.
-
-**File size estimates** (480p, full 2-hour movie):
+### File size estimates (480p, full 2-hour movie)
 
 | Codec | Size |
 |-------|------|
 | `h264` (CRF 18) | ~1–2 GB |
 | `prores` (422 std) | ~25 GB |
 | `prores_hq` (422 HQ) | ~40 GB |
+
+### Standalone detector
+
+[`frame_dedupe/detect.py`](frame_dedupe/detect.py) can be invoked directly (`--mode unblend\|dedupe`) to emit just the segments JSON without rendering. The renderer wraps this internally.
+
+### Caveats
+
+- **Phase calibration on auto-detect:** detection requires high-motion source content to produce reliable signal. Sources that are mostly static (a long take of a still scene) will fall back to the nearest neighbour's phase via the run-length filter. If output looks wrong on a specific scene, render that segment with `--phase` forced and compare.
+- **Boundary loss:** the trailing partial cadence cycle of each segment is dropped (up to ~4 source frames per phase change). With ~50 segments per 2-hour movie this is well under 1 second of total content loss, but it does mean `output_duration < input_duration` by a small amount.
 
 ## Library Maintenance Scripts
 

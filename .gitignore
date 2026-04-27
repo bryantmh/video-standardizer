@@ -9,3 +9,6 @@ video-standardizer.code-workspace
 config.env
 tvdb_cache.json
 comskip_dst/*
+.claude
+.pytest_cache
+.venv

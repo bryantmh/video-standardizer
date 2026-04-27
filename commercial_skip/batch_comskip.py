@@ -28,17 +28,30 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait as _fut_wait, FIRST_COMPLETED
 
-import batch_vrd_save as bvs
-from batch_vrd_save import (
-    _HAS_SEND2TRASH,
-    console, _log, _build_table, _set_slot, _upd_slot, _del_slot,
-    _fmt_bytes, _fmt_elapsed,
-    find_videos, save_vrd, update_tally,
-    VIDEO_EXTS, NO_ADS_SUFFIX,
-)
+try:
+    from . import batch_vrd_save as bvs  # imported as commercial_skip.batch_comskip
+    from .batch_vrd_save import (
+        _HAS_SEND2TRASH,
+        console, _log, _build_table, _set_slot, _upd_slot, _del_slot,
+        _fmt_bytes, _fmt_elapsed,
+        find_videos, save_vrd, update_tally,
+        VIDEO_EXTS, NO_ADS_SUFFIX,
+    )
+except ImportError:
+    # Standalone-script mode: `python commercial_skip/batch_comskip.py` puts
+    # commercial_skip/ on sys.path, so absolute imports work.
+    import batch_vrd_save as bvs
+    from batch_vrd_save import (
+        _HAS_SEND2TRASH,
+        console, _log, _build_table, _set_slot, _upd_slot, _del_slot,
+        _fmt_bytes, _fmt_elapsed,
+        find_videos, save_vrd, update_tally,
+        VIDEO_EXTS, NO_ADS_SUFFIX,
+    )
 from rich.live import Live
 
-_PROJECT_ROOT   = os.path.dirname(os.path.abspath(__file__))
+# comskip_dst/ is shared at the repo root, two levels up from this file.
+_PROJECT_ROOT   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COMSKIP_EXE     = os.path.join(_PROJECT_ROOT, 'comskip_dst', 'comskip.exe')
 COMSKIP_INI     = os.path.join(_PROJECT_ROOT, 'comskip_dst', 'comskip.ini')
 

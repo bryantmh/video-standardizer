@@ -21,7 +21,9 @@ import urllib.request
 import xml.etree.ElementTree as ET
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_CONFIG_ENV = os.path.join(_SCRIPT_DIR, 'config.env')
+# config.env lives in the project root, one level up.
+_PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
+_CONFIG_ENV = os.path.join(_PROJECT_ROOT, 'config.env')
 
 FFMPEG = 'ffmpeg'
 

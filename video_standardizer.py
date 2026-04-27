@@ -19,6 +19,134 @@ CONFIG_FILE = os.path.join(_SCRIPT_DIR, 'video_standardizer_config.json')
 ERROR_LOG = os.path.join(_SCRIPT_DIR, 'conversion_errors.log')
 
 
+# ── Optional-feature dependency probe ────────────────────────────────────────
+# ffmpeg / ffprobe are non-optional and assumed available. The GUI grays out
+# controls whose optional deps are missing, with a tooltip explaining why.
+
+def probe_optional_features():
+    """Return a {feature: (available: bool, reason_if_missing: str)} dict."""
+    result = {}
+
+    # TVDB API key (config.env at repo root).
+    try:
+        config_env = os.path.join(_SCRIPT_DIR, 'config.env')
+        api_key = ''
+        if os.path.isfile(config_env):
+            with open(config_env, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if line.startswith('apikey='):
+                        api_key = line.split('=', 1)[1].strip()
+                        break
+        if api_key:
+            result['tvdb'] = (True, '')
+        else:
+            result['tvdb'] = (
+                False,
+                'No TVDB API key found. Add apikey=... to config.env at the repo root.'
+            )
+    except Exception as e:
+        result['tvdb'] = (False, f'TVDB probe failed: {e}')
+
+    # Comskip executable + comskip.ini.
+    comskip_exe = os.path.join(_SCRIPT_DIR, 'comskip_dst', 'comskip.exe')
+    comskip_ini = os.path.join(_SCRIPT_DIR, 'comskip_dst', 'comskip.ini')
+    if os.path.isfile(comskip_exe) and os.path.isfile(comskip_ini):
+        result['comskip'] = (True, '')
+    else:
+        result['comskip'] = (
+            False,
+            f'Missing {comskip_exe} or {comskip_ini}. Install Comskip into comskip_dst/.'
+        )
+
+    # VideoReDo COM (TVSuite v6) — registry probe only; we don't start the app.
+    # The ProgID is registered under HKEY_CLASSES_ROOT when VideoReDo is
+    # installed and its COM server is registered.
+    try:
+        import winreg
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CLASSES_ROOT, 'VideoReDo6.VideoReDoSilent'
+            ):
+                pass
+            result['videoredo'] = (True, '')
+        except FileNotFoundError:
+            result['videoredo'] = (
+                False,
+                'VideoReDo TVSuite v6 COM not registered. '
+                'Install it and run the registration step.'
+            )
+        except OSError as ce:
+            result['videoredo'] = (
+                False,
+                f'VideoReDo TVSuite v6 COM probe failed: {ce}'
+            )
+    except ImportError:
+        # winreg is part of the stdlib on Windows; missing == not on Windows.
+        result['videoredo'] = (
+            False,
+            'VideoReDo COM is Windows-only.'
+        )
+
+    # VapourSynth + lsmas plugin (frame_dedupe).
+    try:
+        from vapoursynth import core as _core
+        plugin_namespaces = {p.namespace for p in _core.plugins()}
+        if 'lsmas' in plugin_namespaces:
+            result['vapoursynth'] = (True, '')
+        else:
+            result['vapoursynth'] = (
+                False,
+                'VapourSynth installed but the lsmas plugin is missing. '
+                'Install it via: vsrepo.py install lsmas'
+            )
+    except Exception as e:
+        result['vapoursynth'] = (False, f'VapourSynth not available: {e}')
+
+    return result
+
+
+# Probe once at module import; the GUI uses these values to gray out controls.
+OPTIONAL_FEATURES = probe_optional_features()
+
+
+def _attach_tooltip(widget, text: str) -> None:
+    """Attach a hover tooltip to a Tk widget. No-op if text is empty."""
+    if not text:
+        return
+    try:
+        import tkinter as tk_local
+    except ImportError:
+        return
+
+    state = {'tip': None}
+
+    def _show(*_args):
+        if state['tip'] is not None or not text:
+            return
+        x = widget.winfo_rootx() + 12
+        y = widget.winfo_rooty() + widget.winfo_height() + 4
+        tip = tk_local.Toplevel(widget)
+        tip.wm_overrideredirect(True)
+        tip.wm_geometry(f'+{x}+{y}')
+        # Wrap long text so the tip doesn't run off-screen.
+        lbl = tk_local.Label(
+            tip, text=text, justify='left',
+            background='#ffffe0', relief='solid', borderwidth=1,
+            padx=6, pady=3, wraplength=420,
+        )
+        lbl.pack()
+        state['tip'] = tip
+
+    def _hide(*_args):
+        if state['tip'] is not None:
+            state['tip'].destroy()
+            state['tip'] = None
+
+    widget.bind('<Enter>', _show, add='+')
+    widget.bind('<Leave>', _hide, add='+')
+    widget.bind('<ButtonPress>', _hide, add='+')
+
+
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
@@ -975,8 +1103,17 @@ def launch_gui(terminal_cwd=None):
             ttk.Checkbutton(opts_frame, text="Delete Original After Re-process",
                             variable=self.delete_original_var).pack(anchor=tk.W)
             self.remove_ads_var = tk.BooleanVar(value=False)
-            ttk.Checkbutton(opts_frame, text="Remove Ads First (Comskip + VideoReDo)",
-                            variable=self.remove_ads_var).pack(anchor=tk.W)
+            self._remove_ads_chk = ttk.Checkbutton(
+                opts_frame, text="Remove Ads First (Comskip + VideoReDo)",
+                variable=self.remove_ads_var)
+            self._remove_ads_chk.pack(anchor=tk.W)
+            ads_ok, ads_why = (OPTIONAL_FEATURES['comskip'][0]
+                               and OPTIONAL_FEATURES['videoredo'][0]), None
+            if not ads_ok:
+                self._remove_ads_chk.configure(state=tk.DISABLED)
+                ads_why = (OPTIONAL_FEATURES['comskip'][1]
+                           or OPTIONAL_FEATURES['videoredo'][1])
+                _attach_tooltip(self._remove_ads_chk, ads_why)
             ttk.Checkbutton(opts_frame, text="Verbose Output",
                             variable=self.verbose_var).pack(anchor=tk.W)
 
@@ -1003,22 +1140,22 @@ def launch_gui(terminal_cwd=None):
 
             # Find toolbar — each button replaces the file list with a
             # filtered scan of the current input path.
-            find_bar = ttk.Frame(list_frame)
-            find_bar.pack(fill=tk.X, padx=5, pady=(5, 0))
-            ttk.Label(find_bar, text="Find:", font=("", 9, "bold")).pack(
-                side=tk.LEFT, padx=(0, 6))
-            self._find_buttons = []
-            for label, cmd in (
-                ("By Ext",    self._find_by_ext),
-                ("By Name",   self._find_by_name),
-                ("Malformed", self._find_malformed),
-                ("Low-res",   self._find_low_res),
-                ("Corrupt",   self._find_corrupt),
-                ("Metadata",  self._find_metadata),
-            ):
-                b = ttk.Button(find_bar, text=label, command=cmd)
-                b.pack(side=tk.LEFT, padx=(0, 3))
-                self._find_buttons.append(b)
+            # find_bar = ttk.Frame(list_frame)
+            # find_bar.pack(fill=tk.X, padx=5, pady=(5, 0))
+            # ttk.Label(find_bar, text="Find:", font=("", 9, "bold")).pack(
+            #     side=tk.LEFT, padx=(0, 6))
+            # self._find_buttons = []
+            # for label, cmd in (
+            #     ("By Ext",    self._find_by_ext),
+            #     ("By Name",   self._find_by_name),
+            #     ("Malformed", self._find_malformed),
+            #     ("Low-res",   self._find_low_res),
+            #     ("Corrupt",   self._find_corrupt),
+            #     ("Metadata",  self._find_metadata),
+            # ):
+            #     b = ttk.Button(find_bar, text=label, command=cmd)
+            #     b.pack(side=tk.LEFT, padx=(0, 3))
+            #     self._find_buttons.append(b)
 
             list_inner = ttk.Frame(list_frame)
             list_inner.pack(fill=tk.BOTH, expand=True, padx=5, pady=(3, 2))
@@ -1061,8 +1198,13 @@ def launch_gui(terminal_cwd=None):
             list_btn_row.pack(fill=tk.X, padx=5, pady=(0, 5))
             ttk.Button(list_btn_row, text="Show Plan",
                        command=self._show_plan).pack(side=tk.LEFT, padx=(0, 4))
-            ttk.Button(list_btn_row, text="TVDB Lookup",
-                       command=self._tvdb_lookup).pack(side=tk.LEFT, padx=(0, 4))
+            self._tvdb_btn = ttk.Button(
+                list_btn_row, text="TVDB Lookup",
+                command=self._tvdb_lookup)
+            self._tvdb_btn.pack(side=tk.LEFT, padx=(0, 4))
+            if not OPTIONAL_FEATURES['tvdb'][0]:
+                self._tvdb_btn.configure(state=tk.DISABLED)
+                _attach_tooltip(self._tvdb_btn, OPTIONAL_FEATURES['tvdb'][1])
             ttk.Button(list_btn_row, text="Clear Selection",
                        command=self._clear_selection).pack(side=tk.LEFT)
             # Danger action lives on the right, visually separated from the
@@ -1651,7 +1793,7 @@ def launch_gui(terminal_cwd=None):
 
         def _open_plex_popup(self):
             try:
-                from plex_episode_thumbs import build_plex_popup
+                from plex_integration.plex_episode_thumbs import build_plex_popup
             except Exception as e:
                 self._log(f"Could not open Plex popup: {e}", 'drop')
                 return
@@ -1662,7 +1804,7 @@ def launch_gui(terminal_cwd=None):
             if not files:
                 self._log("No files selected for TVDB lookup.")
                 return
-            from tvdb_lookup import build_tvdb_popup
+            from tvdb_lookup.tvdb_lookup import build_tvdb_popup
 
             def _apply_cb(filepath, changes):
                 self._tvdb_changes[filepath] = changes
@@ -1785,7 +1927,7 @@ def launch_gui(terminal_cwd=None):
                                         0, self._update_status,
                                         f"  {phase}: {pct:.0f}%")
                             try:
-                                from batch_comskip import strip_ads_one_file
+                                from commercial_skip.batch_comskip import strip_ads_one_file
                                 success, out_path, msg = strip_ads_one_file(
                                     f, log_fn=lambda m: print_fn(f"  {m}"),
                                     status_fn=_ads_status,

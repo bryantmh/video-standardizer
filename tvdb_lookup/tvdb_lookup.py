@@ -17,8 +17,10 @@ import urllib.parse
 from difflib import SequenceMatcher
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_CACHE_FILE = os.path.join(_SCRIPT_DIR, 'tvdb_cache.json')
-_CONFIG_ENV = os.path.join(_SCRIPT_DIR, 'config.env')
+# config.env and tvdb_cache.json live in the project root, one level up.
+_PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
+_CACHE_FILE = os.path.join(_PROJECT_ROOT, 'tvdb_cache.json')
+_CONFIG_ENV = os.path.join(_PROJECT_ROOT, 'config.env')
 _BASE_URL = 'https://api4.thetvdb.com/v4'
 
 # ── Cache ────────────────────────────────────────────────────────────────
