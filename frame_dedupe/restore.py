@@ -178,14 +178,28 @@ total = clip.num_frames
 
 def transform_segment(seg, skip):
     """Apply the per-cycle transform after skipping `skip` frames so seg[skip]
-    is the cadence anchor. Returns None if the segment is too short."""
+    is the cadence anchor.
+
+    Tail frames (0-4 per segment) that don't complete a full cycle are handled
+    with round(tail * 4/5) passthrough — i.e. [0,1,2,2,3] frames kept for
+    tail sizes [0,1,2,3,4].  This is the same 4:5 ratio as the main transform,
+    so the total output frame count matches the expected 4/5 of the source and
+    A/V sync is maintained over the full film.
+    """
     if skip:
         seg = seg[skip:]
-    usable = (seg.num_frames // 5) * 5
+    n = seg.num_frames
+    usable = (n // 5) * 5
+    tail_count = n - usable
+    tail_keep = [0, 1, 2, 2, 3][tail_count]
     if usable < 5:
-        return None
+        return seg[:tail_keep] if tail_keep > 0 else None
+    full_seg = seg
     seg = seg[:usable]
 {transform_body}
+    if tail_keep > 0:
+        result = result + full_seg[usable:usable + tail_keep]
+    return result
 
 
 parts = []
@@ -215,35 +229,34 @@ out.set_output()
 TRANSFORM_BODY = {
     # 5:4 weighted-blend pulldown -> recover F_d algebraically.
     "unblend": """\
+    nc = seg.num_frames // 5
     Fa = core.std.SelectEvery(seg, cycle=5, offsets=[0])
     Fb = core.std.SelectEvery(seg, cycle=5, offsets=[1])
     Fc = core.std.SelectEvery(seg, cycle=5, offsets=[2])
     b1 = core.std.SelectEvery(seg, cycle=5, offsets=[3])
     b2 = core.std.SelectEvery(seg, cycle=5, offsets=[4])
-    next_seg = seg[5:]
-    usable_next = (next_seg.num_frames // 5) * 5
-    if usable_next < 5:
-        Fe = b2  # last group has no successor; b2 stand-in introduces small error on tail
+    # For all cycles except the last, Fe = F_a of the next cycle (exact).
+    # For the last cycle there is no following cycle within this segment,
+    # so use b2 as a stand-in for Fe (introduces a small error on the
+    # reconstructed F_d of the last cycle, but avoids losing the cycle
+    # entirely as the old code did).
+    Fe_last = b2[nc - 1:nc]
+    if nc >= 2:
+        Fe_main = core.std.SelectEvery(seg[5:], cycle=5, offsets=[0])[:nc - 1]
+        Fe = Fe_main + Fe_last
     else:
-        next_seg = next_seg[:usable_next]
-        Fe = core.std.SelectEvery(next_seg, cycle=5, offsets=[0])
-    n = min(Fa.num_frames, Fb.num_frames, Fc.num_frames,
-            b1.num_frames, b2.num_frames, Fe.num_frames)
-    if n == 0:
-        return None
-    Fa = Fa[:n]; Fb = Fb[:n]; Fc = Fc[:n]
-    b1 = b1[:n]; b2 = b2[:n]; Fe = Fe[:n]
+        Fe = Fe_last
     Fd = core.std.Expr(
         clips=[b1, b2, Fc, Fe],
         expr="x y + z 0.5 * - a 0.5 * -",
     )
-    return core.std.Interleave([Fa, Fb, Fc, Fd])""",
+    result = core.std.Interleave([Fa, Fb, Fc, Fd])""",
 
     # Duplicate-frame pulldown -> drop dup2 from each cycle.
     # After skip alignment the cycle is [dup1, dup2, uniq1, uniq2, uniq3].
     # Keep [dup1, uniq1, uniq2, uniq3] = offsets [0, 2, 3, 4].
     "dedupe": """\
-    return core.std.SelectEvery(seg, cycle=5, offsets=[0, 2, 3, 4])""",
+    result = core.std.SelectEvery(seg, cycle=5, offsets=[0, 2, 3, 4])""",
 }
 
 
