@@ -151,3 +151,9 @@ If VapourSynth is installed but has a broken plugin, the probe call raises an un
 5: We functionally have checkboxes and the row below the file dialog that do similar things. UX should be merged and simplified
 6: Rich functionality doesn't work in built-in terminal.
 7: Should have option to not include new suffix
+8: Should have 60fps deduping support
+9: Should have menu item to set various config options for the different subprojects
+10: Menu item with about
+11: Menu item showing missing dependencies for parts of the functionality.
+12: More beautify modern UI
+13: Menu option to save current checkboxes as default
