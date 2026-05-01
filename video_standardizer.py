@@ -919,6 +919,7 @@ def launch_gui(terminal_cwd=None):
             self._tvdb_changes = {}  # filepath -> {year, sxxexx, episode_title}
             self._multi_drop_active = False
             self._multi_drop_sentinel = ""
+            self._find_buttons = []  # populated when find toolbar is un-commented
 
             # Register the root window as a drop target so the whole app
             # accepts file/folder drops, not just the path entry field.
@@ -1383,9 +1384,13 @@ def launch_gui(terminal_cwd=None):
             remaining = [p for p in self._file_paths if os.path.exists(p)]
             self.file_listbox.delete(0, tk.END)
             self._file_paths = []
+            _done_pat = re.compile(r'\[\w+ [\d.]+Mbps \w+\]\.\w+$')
             for p in remaining:
                 self.file_listbox.insert(tk.END, f"  {os.path.basename(p)}")
                 self._file_paths.append(p)
+            for idx, f in enumerate(self._file_paths):
+                if _done_pat.search(os.path.basename(f)):
+                    self._set_file_status(idx, 'done')
 
             self._log(f"Recycled {recycled} file(s)" +
                       (f", {failed} failed" if failed else "") + ".",
@@ -1716,10 +1721,8 @@ def launch_gui(terminal_cwd=None):
                 out = []
                 for dp, _d, fs in os.walk(root):
                     for f in fs:
-                        stem, ext = os.path.splitext(f)
-                        if not ext:
-                            out.append(os.path.join(dp, f))
-                        elif ext.lower() in self._FIND_VIDEO_EXTS and not _sxxexx.search(stem):
+                        _stem, ext = os.path.splitext(f)
+                        if ext.lower() in self._FIND_VIDEO_EXTS and not _sxxexx.search(_stem):
                             out.append(os.path.join(dp, f))
                 return sorted(out)
 
